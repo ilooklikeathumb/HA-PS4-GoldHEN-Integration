@@ -4,6 +4,7 @@ import importlib.util
 import json
 import pathlib
 import sys
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -162,7 +163,7 @@ class ParserTests(unittest.TestCase):
         self.assertIsNone(ftp.parse_telemetry(b'{"cpu_temp":null}')['cpu_temp'])
 
 class WrapperTests(unittest.IsolatedAsyncioTestCase):
-    async def test_bad_telemetry_clears_dynamic_values_without_erasing_game(self):
+    def wrapper(self, enabled):
         import logging
         from typing import Any
         source=(ROOT/'custom_components/ps4_goldhen/__init__.py').read_text()
@@ -172,12 +173,32 @@ class WrapperTests(unittest.IsolatedAsyncioTestCase):
         root={'entry':{'klog_data':{'cpu_temp':63,'current_game':'CUSA00001'}}}
         ns['_ensure_domain_root']=lambda hass: root
         ns['_PS4STATE_JSON_PATH']='/state.json'
-        async def fetch(*args): return ftp.TelemetryResult(True,None,'ftp_550')
+        ns['_FTP_TELEMETRY_ENABLED']=enabled
+        self.fetches=[]
+        async def fetch(*args):
+            self.fetches.append(args)
+            return ftp.TelemetryResult(True,None,'ftp_550')
         ns['async_fetch_telemetry']=fetch
+        self.locks=[]
+        def lock(data):
+            self.locks.append(asyncio.Lock());return self.locks[-1]
+        ns['ftp_session']=SimpleNamespace(lock=lock)
         exec(compile(ast.Module(body=[node],type_ignores=[]),'wrapper','exec'),ns)
-        result=await ns['_poll_ftp_json']('ps4',2121,'entry',object(),object())
+        return ns['_poll_ftp_json']
+
+    async def test_bad_telemetry_clears_dynamic_values_without_erasing_game(self):
+        result=await self.wrapper(True)('ps4',2121,'entry',object(),object())
         self.assertIsNone(result['cpu_temp'])
         self.assertEqual(result['current_game'],'CUSA00001')
         self.assertTrue(result['ftp_reachable'])
+        self.assertEqual(len(self.locks),1,'the poll takes the FTP lock')
+
+    async def test_disabled_telemetry_opens_no_ftp_session(self):
+        result=await self.wrapper(False)('ps4',2121,'entry',object(),object())
+        self.assertEqual(self.fetches,[])
+        self.assertEqual(result['telemetry_status'],'disabled')
+        self.assertIsNone(result['ftp_reachable'])
+        self.assertEqual(result['cpu_temp'],63)
+        self.assertEqual(result['current_game'],'CUSA00001')
 
 if __name__=='__main__': unittest.main(verbosity=2)

@@ -23,7 +23,6 @@ The mapping is in `_payloadIconUrl()` in `ps4-goldhen-panel.js`. It uses the nor
 - `enable-browser.png`
 - `enable-updates.png`
 - `exit-idu.png`
-- `fan-threshold.png`
 - `ftp.png`
 - `history-blocker.png`
 - `kernel-clock.png`

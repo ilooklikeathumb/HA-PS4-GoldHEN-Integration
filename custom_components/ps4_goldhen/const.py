@@ -8,6 +8,14 @@ CONF_BINLOADER_PORT = "binloader_port"
 CONF_FTP_PORT       = "ftp_port"
 CONF_RPI_PORT       = "rpi_port"
 CONF_KLOG_PORT      = "klog_port"
+CONF_CONSOLE_NAME   = "console_name"  # the console's own name at setup (DDP host-name): the device's default name
+# options — wake the console (media_player turn_on)
+CONF_REGIST_KEY     = "regist_key"   # Remote Play regist key (8 hex) → DDP WAKEUP from rest
+CONF_WAKE_ENTITY    = "wake_entity"  # optional button / script that wakes it another way (e.g. Bluetooth)
+# options — set by the Pair step (Remote Play registration with a PIN)
+CONF_RP_KEY         = "rp_key"       # 32 hex, Remote Play session key from the same pairing (login)
+CONF_ACCOUNT_ID     = "account_id"   # base64 account ID of the pairing (pre-fills the next pairing)
+CONF_PIN            = "pin"          # Pair form field only, never stored
 
 # — Defaults ————————————————————————————————————————————————————————————————
 DEFAULT_PS4_HOST        = "192.168.x.x"
@@ -23,7 +31,7 @@ DB_CACHE_DIR      = f"{PS4_CONFIG_DIR}/db"
 COVER_CACHE_DIR   = f"{PS4_CONFIG_DIR}/covers"
 
 TCP_PROBE_TIMEOUT = 3.0
-PLATFORMS: list[str] = ["sensor", "button"]
+PLATFORMS: list[str] = ["sensor", "button", "image", "media_player", "switch", "number"]
 
 # — Sensor data keys ————————————————————————————————————————————————————————
 SENSOR_CURRENT_GAME   = "current_game"
@@ -42,14 +50,23 @@ SENSOR_TOTAL_POWER = "total_power_w"
 
 # — New PS4StateJSON v14 keys ————————————————————————————————————————————————
 SENSOR_FAN_DUTY   = "fan_duty"
+SENSOR_FAN_THRESHOLD = "fan_threshold"  # °C the fan works to hold (live sensors payload's `thr`)
 SENSOR_FW_VERSION = "fw_version"
 SENSOR_HW_MODEL   = "hw_model"
 SENSOR_CONSOLE_ID = "console_id"
 
-EVENT_KLOG_LINE = "ps4_goldhen_klog_event"
-EVENT_KLOG_STREAM = "ps4_goldhen_klog_stream"
 HOME_SCREEN     = "PlayStation Home Screen"
 
+
+def signal_klog_line(entry_id: str) -> str:
+    """Raw klog lines go to the panel by dispatcher, not the event bus (the recorder would store every line)."""
+    return f"{DOMAIN}_klog_line_{entry_id}"
+
+# console power state parsed from klog (SceSystemStateMgr)
+POWER_ON   = "on"
+POWER_REST = "rest"
+POWER_OFF  = "off"
+
 APP_DB_REMOTE        = "/system_data/priv/mms/app.db"
-APP_DB_LOCAL         = f"{DB_CACHE_DIR}/app.db"
-DB_REFRESH_INTERVAL  = 300
+APP_DB_LOCAL         = f"{DB_CACHE_DIR}/{{host}}/app.db"  # one per console
+DB_REFRESH_INTERVAL  = 3600  # s between FTP app.db pulls (1 h)

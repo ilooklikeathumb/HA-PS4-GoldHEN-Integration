@@ -1,13 +1,14 @@
 {
   "domain": "ps4_goldhen",
   "name": "PS4 GoldHEN",
-  "codeowners": ["@Tech-Morph"],
+  "codeowners": ["@ilooklikeathumb"],
   "config_flow": true,
   "dependencies": ["http", "frontend"],
-  "documentation": "https://github.com/Tech-Morph/HA-PS4-GoldHEN-Integration",
+  "dhcp": [{"registered_devices": true}],
+  "documentation": "https://github.com/ilooklikeathumb/HA-PS4-GoldHEN-Integration",
   "integration_type": "hub",
   "iot_class": "local_push",
-  "issue_tracker": "https://github.com/Tech-Morph/HA-PS4-GoldHEN-Integration/issues",
+  "issue_tracker": "https://github.com/ilooklikeathumb/HA-PS4-GoldHEN-Integration/issues",
   "requirements": [],
-  "version": "0.9.0"
+  "version": "1.0.0"
 }

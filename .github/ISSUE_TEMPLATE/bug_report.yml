@@ -1,0 +1,68 @@
+name: Bug report
+description: Something doesn't work on your PS4 (or works on a model / firmware not in the README's table).
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. The model, firmware and GoldHEN version matter most: payload support differs per firmware.
+        Before pasting logs, remove your console's serial number, your account ID and any Remote Play keys.
+  - type: dropdown
+    id: model
+    attributes:
+      label: PS4 model
+      options:
+        - PS4 original (CUH-1000 / 1100 / 1200)
+        - PS4 Slim (CUH-2000 series)
+        - PS4 Pro (CUH-7000 / 7100 / 7200)
+        - Not sure
+    validations:
+      required: true
+  - type: input
+    id: model_number
+    attributes:
+      label: Model number
+      description: On the sticker on the back or bottom of the console.
+      placeholder: CUH-2215B
+  - type: input
+    id: firmware
+    attributes:
+      label: Firmware
+      description: Settings → System → System Information → System Software.
+      placeholder: "11.00"
+    validations:
+      required: true
+  - type: input
+    id: goldhen
+    attributes:
+      label: GoldHEN version
+      placeholder: 2.4b18.12
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Integration and Home Assistant versions
+      description: Integration version from HACS (or `manifest.json`); HA version from Settings → About.
+      placeholder: 1.0.0 / 2026.10.1
+    validations:
+      required: true
+  - type: textarea
+    id: what_happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, what you got instead. Which feature (game status, wake, launch, rest, screenshots, saves, payloads, ...)?
+    validations:
+      required: true
+  - type: textarea
+    id: klog
+    attributes:
+      label: klog excerpt
+      description: The panel's Klog tab shows the console's log live. Copy the lines from just before to just after the problem.
+      render: text
+  - type: textarea
+    id: ha_log
+    attributes:
+      label: Home Assistant log
+      description: Settings → System → Logs, lines that mention ps4_goldhen.
+      render: text

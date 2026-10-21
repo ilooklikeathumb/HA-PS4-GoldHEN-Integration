@@ -27,15 +27,23 @@ class FTPHandlerTests(unittest.IsolatedAsyncioTestCase):
         api=ModuleType('homeassistant.components.websocket_api')
         api.websocket_command=lambda schema:lambda f:f
         api.async_response=lambda f:f
+        api.require_admin=lambda f:f
         api.ActiveConnection=object
         components.websocket_api=api
         core=ModuleType('homeassistant.core')
         core.HomeAssistant=object;core.callback=lambda f:f
+        helpers=ModuleType('homeassistant.helpers');helpers.__path__=[]
+        dispatcher=ModuleType('homeassistant.helpers.dispatcher')
+        dispatcher.async_dispatcher_connect=lambda *args:lambda:None
+        util=ModuleType('homeassistant.util');util.__path__=[]
+        dt=ModuleType('homeassistant.util.dt');util.dt=dt
         package=ModuleType('_ps4_handler_test');package.__path__=[str(MODULE.parent)]
         const=ModuleType('_ps4_handler_test.const')
         exec((MODULE.parent/'const.py').read_text(),const.__dict__)
         fake={'voluptuous':vol,'homeassistant':ha,'homeassistant.components':components,
               'homeassistant.components.websocket_api':api,'homeassistant.core':core,
+              'homeassistant.helpers':helpers,'homeassistant.helpers.dispatcher':dispatcher,
+              'homeassistant.util':util,'homeassistant.util.dt':dt,
               '_ps4_handler_test':package,'_ps4_handler_test.const':const}
         self.modules=patch.dict(sys.modules,fake);self.modules.start();self.addCleanup(self.modules.stop)
         spec=importlib.util.spec_from_file_location('_ps4_handler_test.websocket',MODULE)
@@ -43,7 +51,8 @@ class FTPHandlerTests(unittest.IsolatedAsyncioTestCase):
         sys.modules[spec.name]=self.ws
         self.addCleanup(lambda:sys.modules.pop(spec.name,None))
         spec.loader.exec_module(self.ws)
-        self.hass=SimpleNamespace(data={'ps4_goldhen':{'entry':{'host':'ps4.test','ftp_port':2121}}})
+        self.hass=SimpleNamespace(data={'ps4_goldhen':{'entry':{'host':'ps4.test','ftp_port':2121}}},
+                                 async_add_executor_job=lambda f,*a:asyncio.get_running_loop().run_in_executor(None,f,*a))
 
     async def exercise(self,handler,helper,msg,value,expected):
         c=Connection()

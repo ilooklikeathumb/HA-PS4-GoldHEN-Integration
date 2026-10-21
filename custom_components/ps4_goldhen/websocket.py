@@ -10,9 +10,12 @@ import voluptuous as vol
 
 from homeassistant.components import websocket_api
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.dispatcher import async_dispatcher_connect
+from homeassistant.util import dt as dt_util
 
-from .const import DOMAIN, DEFAULT_FTP_PORT, EVENT_KLOG_STREAM
+from .const import DOMAIN, DEFAULT_FTP_PORT, signal_klog_line
 from .ftp_listing import list_directory
+from . import ftp_session
 
 # FTP timeout for all operations (seconds)
 _FTP_TIMEOUT = 15
@@ -107,6 +110,7 @@ def async_setup(hass: HomeAssistant) -> None:
         vol.Optional("path", default="/"): str,
     }
 )
+@websocket_api.require_admin
 @websocket_api.async_response
 async def ws_list_dir(
     hass: HomeAssistant,
@@ -118,9 +122,10 @@ async def ws_list_dir(
     path = msg["path"] or "/"
     host, port = _get_ftp_params(hass, entry_id)
     try:
-        loop = asyncio.get_running_loop()
-        entries = await loop.run_in_executor(None, _ftp_list_dir, host, port, path)
+        entries = await _ftp(hass, msg["entry_id"], _ftp_list_dir, host, port, path)
         connection.send_result(msg["id"], {"path": path, "entries": entries})
+    except ftp_session.FTPBusy as err:
+        connection.send_error(msg["id"], "ftp_busy", str(err))
     except ftplib.all_errors as err:
         connection.send_error(msg["id"], "ftp_error", str(err))
     except Exception as err:  # noqa: BLE001
@@ -136,6 +141,7 @@ async def ws_list_dir(
         vol.Required("is_dir"): bool,
     }
 )
+@websocket_api.require_admin
 @websocket_api.async_response
 async def ws_delete(
     hass: HomeAssistant,
@@ -145,9 +151,10 @@ async def ws_delete(
     """Delete a file or empty directory on the PS4 via FTP."""
     host, port = _get_ftp_params(hass, msg["entry_id"])
     try:
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, _ftp_delete, host, port, msg["path"], msg["is_dir"])
+        await _ftp(hass, msg["entry_id"], _ftp_delete, host, port, msg["path"], msg["is_dir"])
         connection.send_result(msg["id"], {"success": True})
+    except ftp_session.FTPBusy as err:
+        connection.send_error(msg["id"], "ftp_busy", str(err))
     except ftplib.all_errors as err:
         connection.send_error(msg["id"], "ftp_error", str(err))
     except Exception as err:  # noqa: BLE001
@@ -163,6 +170,7 @@ async def ws_delete(
         vol.Required("to_path"): str,
     }
 )
+@websocket_api.require_admin
 @websocket_api.async_response
 async def ws_rename(
     hass: HomeAssistant,
@@ -172,9 +180,10 @@ async def ws_rename(
     """Rename a file or directory on the PS4 via FTP."""
     host, port = _get_ftp_params(hass, msg["entry_id"])
     try:
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, _ftp_rename, host, port, msg["from_path"], msg["to_path"])
+        await _ftp(hass, msg["entry_id"], _ftp_rename, host, port, msg["from_path"], msg["to_path"])
         connection.send_result(msg["id"], {"success": True})
+    except ftp_session.FTPBusy as err:
+        connection.send_error(msg["id"], "ftp_busy", str(err))
     except ftplib.all_errors as err:
         connection.send_error(msg["id"], "ftp_error", str(err))
     except Exception as err:  # noqa: BLE001
@@ -189,6 +198,7 @@ async def ws_rename(
         vol.Required("path"): str,
     }
 )
+@websocket_api.require_admin
 @websocket_api.async_response
 async def ws_mkdir(
     hass: HomeAssistant,
@@ -198,9 +208,10 @@ async def ws_mkdir(
     """Create a directory on the PS4 via FTP."""
     host, port = _get_ftp_params(hass, msg["entry_id"])
     try:
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, _ftp_mkdir, host, port, msg["path"])
+        await _ftp(hass, msg["entry_id"], _ftp_mkdir, host, port, msg["path"])
         connection.send_result(msg["id"], {"success": True})
+    except ftp_session.FTPBusy as err:
+        connection.send_error(msg["id"], "ftp_busy", str(err))
     except ftplib.all_errors as err:
         connection.send_error(msg["id"], "ftp_error", str(err))
     except Exception as err:  # noqa: BLE001
@@ -215,6 +226,7 @@ async def ws_mkdir(
         vol.Required("path"): str,
     }
 )
+@websocket_api.require_admin
 @websocket_api.async_response
 async def ws_get_text(
     hass: HomeAssistant,
@@ -224,9 +236,10 @@ async def ws_get_text(
     """Read content of a text file via FTP."""
     host, port = _get_ftp_params(hass, msg["entry_id"])
     try:
-        loop = asyncio.get_running_loop()
-        content = await loop.run_in_executor(None, _ftp_get_text, host, port, msg["path"])
+        content = await _ftp(hass, msg["entry_id"], _ftp_get_text, host, port, msg["path"])
         connection.send_result(msg["id"], {"content": content})
+    except ftp_session.FTPBusy as err:
+        connection.send_error(msg["id"], "ftp_busy", str(err))
     except ftplib.all_errors as err:
         connection.send_error(msg["id"], "ftp_error", str(err))
     except Exception as err:  # noqa: BLE001
@@ -242,6 +255,7 @@ async def ws_get_text(
         vol.Required("content"): str,
     }
 )
+@websocket_api.require_admin
 @websocket_api.async_response
 async def ws_put_text(
     hass: HomeAssistant,
@@ -251,9 +265,10 @@ async def ws_put_text(
     """Save content to a text file via FTP."""
     host, port = _get_ftp_params(hass, msg["entry_id"])
     try:
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, _ftp_put_text, host, port, msg["path"], msg["content"])
+        await _ftp(hass, msg["entry_id"], _ftp_put_text, host, port, msg["path"], msg["content"])
         connection.send_result(msg["id"], {"success": True})
+    except ftp_session.FTPBusy as err:
+        connection.send_error(msg["id"], "ftp_busy", str(err))
     except ftplib.all_errors as err:
         connection.send_error(msg["id"], "ftp_error", str(err))
     except Exception as err:  # noqa: BLE001
@@ -269,6 +284,7 @@ async def ws_put_text(
         vol.Optional("port"): vol.All(vol.Coerce(int), vol.Range(min=1, max=65535)),
     }
 )
+@websocket_api.require_admin
 @websocket_api.async_response
 async def ws_klog_subscribe(
     hass: HomeAssistant,
@@ -283,11 +299,7 @@ async def ws_klog_subscribe(
         return
 
     @callback
-    def _forward(event) -> None:
-        data = event.data
-        if data.get("entry_id") != entry_id:
-            return
-        line = data.get("message")
+    def _forward(line) -> None:
         if not isinstance(line, str):
             return
         connection.send_message(
@@ -296,13 +308,14 @@ async def ws_klog_subscribe(
                 "type": "event",
                 "event": {
                     "line": line,
-                    "time": event.time_fired.isoformat(),
+                    "time": dt_util.utcnow().isoformat(),
                 },
             }
         )
 
-    connection.subscriptions[msg["id"]] = hass.bus.async_listen(
-        EVENT_KLOG_STREAM, _forward
+    # the listener sends this console's lines on its own signal (no event bus, nothing recorded)
+    connection.subscriptions[msg["id"]] = async_dispatcher_connect(
+        hass, signal_klog_line(entry_id), _forward
     )
     connection.send_result(
         msg["id"],
@@ -316,6 +329,13 @@ async def ws_klog_subscribe(
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
+async def _ftp(hass: HomeAssistant, entry_id: str, func, *args):
+    """A panel FTP action under the console's FTP lock (ftp_session): it waits its turn, at most FTP_BUSY_WAIT."""
+    return await ftp_session.run(
+        hass, hass.data[DOMAIN][entry_id], func, *args, wait=ftp_session.FTP_BUSY_WAIT
+    )
+
+
 def _get_ftp_params(hass: HomeAssistant, entry_id: str) -> tuple[str, int]:
     """Pull host + FTP port from stored entry data."""
     data = hass.data[DOMAIN][entry_id]

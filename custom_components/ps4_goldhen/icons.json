@@ -1,0 +1,27 @@
+{
+  "entity": {
+    "sensor": {
+      "status": {
+        "default": "mdi:sony-playstation",
+        "state": {
+          "playing": "mdi:gamepad-variant",
+          "home_screen": "mdi:sony-playstation",
+          "rest": "mdi:power-sleep",
+          "off": "mdi:power-off"
+        }
+      },
+      "play_time_today": {
+        "default": "mdi:timer-outline"
+      },
+      "play_time_7_days": {
+        "default": "mdi:calendar-week"
+      },
+      "play_time_30_days": {
+        "default": "mdi:calendar-month"
+      },
+      "current_session": {
+        "default": "mdi:gamepad-variant-outline"
+      }
+    }
+  }
+}

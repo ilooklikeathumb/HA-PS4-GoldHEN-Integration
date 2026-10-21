@@ -31,29 +31,61 @@ def load_integration():
         def __init_subclass__(cls, **kwargs):
             pass
 
+    class Entity:
+        pass
+
+    class Any_:
+        def __getattr__(self, name):
+            return name
+
     api = module("homeassistant.components.websocket_api",
-                 websocket_command=lambda schema: lambda fn: fn,
-                 async_response=lambda fn: fn, async_register_command=lambda *a: None)
+                 websocket_command=lambda schema: lambda fn: fn, require_admin=lambda fn: fn,
+                 async_response=lambda fn: fn, async_register_command=lambda *a: None,
+                 ActiveConnection=object)
+    device_registry = module("homeassistant.helpers.device_registry", DeviceInfo=dict)
+    entity_registry = module("homeassistant.helpers.entity_registry")
+    config_entries = module("homeassistant.config_entries", ConfigEntry=object,
+                            ConfigFlow=Flow, OptionsFlow=Flow)
+    util_dt = module("homeassistant.util.dt")
     vol = module("voluptuous", Schema=lambda value: value,
                  Required=lambda value, **kw: value, Optional=lambda value, **kw: value,
-                 All=lambda *a: None, Coerce=lambda *a: None, Range=lambda **kw: None)
+                 All=lambda *a: None, Coerce=lambda *a: None, Range=lambda **kw: None,
+                 In=lambda *a: None, Length=lambda **kw: None)
     fake = {
         "voluptuous": vol,
         "aiohttp": module("aiohttp", web=SimpleNamespace()),
-        "homeassistant": module("homeassistant"),
+        "homeassistant": module("homeassistant", config_entries=config_entries),
         "homeassistant.components": module("homeassistant.components",
             websocket_api=api, panel_custom=SimpleNamespace()),
         "homeassistant.components.websocket_api": api,
+        "homeassistant.components.button": module("homeassistant.components.button", ButtonEntity=Entity),
         "homeassistant.components.frontend": module("homeassistant.components.frontend", StaticPathConfig=object),
         "homeassistant.components.http": module("homeassistant.components.http", HomeAssistantView=object),
-        "homeassistant.config_entries": module("homeassistant.config_entries", ConfigEntry=object,
-            ConfigFlow=Flow, OptionsFlow=Flow),
+        "homeassistant.components.image": module("homeassistant.components.image", ImageEntity=Entity),
+        "homeassistant.components.sensor": module("homeassistant.components.sensor",
+            SensorDeviceClass=Any_(), SensorEntity=Entity),
+        "homeassistant.config_entries": config_entries,
+        "homeassistant.const": module("homeassistant.const", EVENT_HOMEASSISTANT_STOP="homeassistant_stop"),
         "homeassistant.core": module("homeassistant.core", HomeAssistant=object,
             ServiceCall=object, callback=lambda fn: fn),
         "homeassistant.data_entry_flow": module("homeassistant.data_entry_flow", FlowResult=dict),
         "homeassistant.exceptions": module("homeassistant.exceptions", HomeAssistantError=RuntimeError),
-        "homeassistant.helpers": module("homeassistant.helpers"),
+        "homeassistant.helpers": module("homeassistant.helpers",
+            device_registry=device_registry, entity_registry=entity_registry),
         "homeassistant.helpers.update_coordinator": module("homeassistant.helpers.update_coordinator", DataUpdateCoordinator=Coordinator),
+        # console_info.py (imported by __init__.py)
+        "homeassistant.helpers.device_registry": device_registry,
+        "homeassistant.helpers.entity_registry": entity_registry,
+        "homeassistant.helpers.storage": module("homeassistant.helpers.storage", Store=object),
+        "homeassistant.helpers.dispatcher": module("homeassistant.helpers.dispatcher",
+            async_dispatcher_send=lambda *a: None, async_dispatcher_connect=lambda *a: None),
+        "homeassistant.helpers.event": module("homeassistant.helpers.event",
+            async_call_later=lambda *a: None, async_track_time_interval=lambda *a: None),
+        "homeassistant.helpers.selector": module("homeassistant.helpers.selector",
+            EntitySelector=lambda config: config, EntitySelectorConfig=dict,
+            TextSelector=lambda config: config, TextSelectorConfig=dict, TextSelectorType=Any_()),
+        "homeassistant.util": module("homeassistant.util", dt=util_dt),
+        "homeassistant.util.dt": util_dt,
     }
     name = "_ps4_issue1_test"
     old = {k: v for k, v in sys.modules.items() if k == name or k.startswith(name + ".")}
@@ -225,7 +257,9 @@ class SocketTests(unittest.IsolatedAsyncioTestCase):
         hass = SimpleNamespace(data={})
         root = self.integration._ensure_domain_root(hass)
         root["entry"] = {"klog_data": {"current_game": "CUSA00001", "cpu_temp": 63}}
-        with patch.object(self.transport.asyncio, "open_connection", side_effect=OSError("offline")):
+        # Telemetry ships off; this covers the poll for when it's switched back on.
+        with patch.object(self.integration, "_FTP_TELEMETRY_ENABLED", True), \
+                patch.object(self.transport.asyncio, "open_connection", side_effect=OSError("offline")):
             result = await self.integration._poll_ftp_json("ps4.test", 2121, "entry", hass, object())
         self.assertFalse(result["ftp_reachable"])
         self.assertEqual(result["telemetry_status"], "connection_error")
@@ -265,34 +299,58 @@ class SocketTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(asyncio.CancelledError):
                 await task
 
-    async def test_complete_setup_module_without_telemetry(self):
+    async def setup_entry(self, ftp_port):
+        """Run async_setup_entry; the feature hooks have their own suites, so here they only have to be called."""
+        hass = SimpleNamespace(data={},
+            config_entries=SimpleNamespace(async_forward_entry_setups=AsyncMock()),
+            services=SimpleNamespace(has_service=lambda *a: True))
+        global_state = self.integration._global(hass)
+        for key in global_state:
+            global_state[key] = True
+        tasks = []
+        def background(hass, coro, *, name):
+            tasks.append(name)
+            coro.close()
+            return SimpleNamespace(done=lambda: True)
+        entry = SimpleNamespace(entry_id="entry", data={"ps4_host": "127.0.0.1", "ftp_port": ftp_port},
+            async_create_background_task=background, async_on_unload=lambda callback: None,
+            add_update_listener=lambda fn: lambda: None)
+        features = ("console_info", "live_sensors", "screenshots", "play_time", "game_session", "save_backup")
+        with contextlib.ExitStack() as stack:
+            hooks = [stack.enter_context(patch.object(getattr(self.integration, name), "async_setup", autospec=True))
+                     for name in features]
+            fan_load = stack.enter_context(patch.object(self.integration.fan, "async_load", autospec=True))
+            self.assertTrue(await asyncio.wait_for(self.integration.async_setup_entry(hass, entry), 1))
+        for name, hook in zip(features, hooks):
+            with self.subTest(feature=name):
+                hook.assert_called_once()
+        fan_load.assert_awaited_once()
+        self.assertEqual(len(tasks), 2)
+        hass.config_entries.async_forward_entry_setups.assert_awaited_once()
+        return hass.data["ps4_goldhen"]["entry"]["coordinator"].data
+
+    async def test_complete_setup_module_telemetry_off_opens_no_ftp(self):
+        async with LocalFTP("ok", b'{"cpu_temp":63}') as server:
+            fetch = AsyncMock()
+            with patch.object(self.integration, "async_fetch_telemetry", fetch):
+                data = await self.setup_entry(server.port)
+        fetch.assert_not_awaited()
+        self.assertEqual(server.commands, [])
+        self.assertEqual(data["telemetry_status"], "disabled")
+        self.assertIsNone(data["ftp_reachable"])
+
+    async def test_complete_setup_module_with_telemetry_on(self):
         for mode, body, status in (("missing", b"", "ftp_550"), ("stall", b"", "timeout"),
                                   ("ok", b"{", "invalid_json"), ("ok", b'{"cpu_temp":63}', "ok")):
             with self.subTest(mode=mode, status=status):
                 async with LocalFTP(mode, body) as server:
-                    hass = SimpleNamespace(data={},
-                        config_entries=SimpleNamespace(async_forward_entry_setups=AsyncMock()),
-                        services=SimpleNamespace(has_service=lambda *a: True))
-                    global_state = self.integration._global(hass)
-                    for key in global_state:
-                        global_state[key] = True
-                    tasks = []
-                    def background(hass, coro, *, name):
-                        tasks.append(name)
-                        coro.close()
-                        return SimpleNamespace(done=lambda: True)
-                    entry = SimpleNamespace(entry_id="entry", data={"ps4_host": "127.0.0.1", "ftp_port": server.port},
-                        async_create_background_task=background, async_on_unload=lambda callback: None,
-                        add_update_listener=lambda fn: lambda: None)
                     async def bounded_fetch(*args):
                         return await self.transport.async_fetch_telemetry(*args, operation_timeout=0.08, total_timeout=0.4)
-                    with patch.object(self.integration, "async_fetch_telemetry", bounded_fetch):
-                        self.assertTrue(await asyncio.wait_for(self.integration.async_setup_entry(hass, entry), 1))
-                    data = hass.data["ps4_goldhen"]["entry"]["coordinator"].data
+                    with patch.object(self.integration, "_FTP_TELEMETRY_ENABLED", True), \
+                            patch.object(self.integration, "async_fetch_telemetry", bounded_fetch):
+                        data = await self.setup_entry(server.port)
                     self.assertEqual(data["telemetry_status"], status)
                     self.assertTrue(data["ftp_reachable"])
-                    self.assertEqual(len(tasks), 2)
-                    hass.config_entries.async_forward_entry_setups.assert_awaited_once()
 
 
 if __name__ == "__main__":

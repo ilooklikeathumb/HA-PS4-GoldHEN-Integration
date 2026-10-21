@@ -5,6 +5,10 @@ on:
     types:
       - published
 
+# the zip upload needs write access (a new repo's Actions token is read-only by default)
+permissions:
+  contents: write
+
 jobs:
   release:
     name: Release

@@ -48,13 +48,18 @@ jobs:
           for path in Path("custom_components/ps4_goldhen").rglob("*.json"):
               json.loads(path.read_text(encoding="utf-8"))
           PY
+      - name: Install test dependencies
+        # Remote Play pairing / wake (rp_regist, rp_session) needs it; HA ships it, the runner doesn't.
+        run: python -m pip install cryptography==50.0.2
       - name: Run Python regression suites
         run: |
-          python -B tests/test_ftp_telemetry.py
-          python -B tests/test_issue1_connection.py
-          python -B tests/test_klog_shared.py
-          python -B tests/test_websocket_ftp_runtime.py
-          python -B tests/test_ftp_listing.py
+          status=0
+          for suite in tests/test_*.py; do
+            echo "::group::$suite"
+            python -B "$suite" || status=1
+            echo "::endgroup::"
+          done
+          exit "$status"
 
   frontend:
     name: Frontend
@@ -72,10 +77,15 @@ jobs:
           package-manager-cache: false
       - name: Check JavaScript syntax
         run: node --check custom_components/ps4_goldhen/frontend/ps4-goldhen-panel.js
-      - name: Check klog subscriptions
-        run: node tests/test_klog_frontend.cjs
-      - name: Check FTP rendering
-        run: node tests/test_ftp_listing_frontend.cjs
+      - name: Run frontend suites
+        run: |
+          status=0
+          for suite in tests/test_*.cjs; do
+            echo "::group::$suite"
+            node "$suite" || status=1
+            echo "::endgroup::"
+          done
+          exit "$status"
 
   regression:
     name: Regression

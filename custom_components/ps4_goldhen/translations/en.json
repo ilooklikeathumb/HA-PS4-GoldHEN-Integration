@@ -3,42 +3,158 @@
     "step": {
       "user": {
         "title": "Connect to PS4 GoldHEN",
-        "description": "Enter the connection details for your PS4. Enable GoldHEN FTP to connect. PS4StateJSON telemetry is optional; klog and BinLoader are used by their respective features.",
+        "description": "Enter your PS4's IP address. GoldHEN must be loaded with its FTP server on; setup checks it.",
         "data": {
-          "ps4_host": "PS4 IP Address",
-          "binloader_port": "BinLoader Port",
-          "ftp_port": "FTP Port"
+          "ps4_host": "PS4 IP Address"
         },
         "data_description": {
-          "ps4_host": "IP address of your PS4 (e.g. 192.168.1.100)",
-          "binloader_port": "BinLoader TCP port (default: 9090)",
-          "ftp_port": "GoldHEN FTP port used to verify connectivity (default: 2121)"
+          "ps4_host": "IP address of your PS4 (e.g. 192.168.1.100)"
+        }
+      },
+      "wake": {
+        "title": "Wake the PS4 from Home Assistant?",
+        "description": "Optional. Pair Home Assistant with the PS4 like a Remote Play app, so the media player can turn it on from rest mode. No chiaki-ng needed. Takes two steps: a user's account ID, then the number from the PS4's Add Device screen. You can also do this later: Configure → Pair with the PS4.",
+        "menu_options": {
+          "account": "Pair now (needs the PS4 and its user's account ID)",
+          "finish": "Skip, finish setup"
+        }
+      },
+      "account": {
+        "title": "Pair with the PS4 (1 of 2): account",
+        "description": "Pairing lets Home Assistant wake the PS4 at {host} from rest mode, and it needs the account ID of a user on that PS4. Look the ID up first: the pairing screen in the next step has to stay open until pairing finishes.\n\n**No PSN (GoldHEN):** on the PS4 open Apollo Save Tool → **User Tools → Activate PS4 Accounts**. Each user is listed as `USERNAME (account ID)`; the ID is the 16 characters in brackets. If the user isn't activated yet, activate it there (offline account). Don't use the all-zero ID (0000000000000000) Apollo shows prefilled.\n\n**PSN user:** not tested yet. HA also accepts a PSN account ID as base64 (the form chiaki-ng uses) or as the decimal number.",
+        "data": {
+          "account_id": "Account ID"
+        },
+        "data_description": {
+          "account_id": "16 hex characters (Apollo), base64 (12 characters ending in =), or the decimal number. Saved, so the next pairing is pre-filled."
+        }
+      },
+      "pin": {
+        "title": "Pair with the PS4 (2 of 2): number",
+        "description": "On the PS4: **Settings → Remote Play Connection Settings**. Turn on **Enable Remote Play**, then open **Add Device**. Enter the 8-digit number it shows and submit **while that screen is still open**: leaving it, or waiting past its 5 minutes, cancels the pairing.",
+        "data": {
+          "pin": "Number from Add Device"
+        },
+        "data_description": {
+          "pin": "The 8-digit number on the PS4's Add Device screen (spaces are fine)."
         }
       }
     },
     "error": {
-      "ftp_not_reachable": "Cannot reach the PS4 FTP service. Check the IP and ensure GoldHEN is running."
+      "ftp_not_reachable": "Cannot reach the PS4 FTP service. Check the IP, and that GoldHEN is loaded with FTP on.",
+      "invalid_pin": "Enter the 8-digit number from the PS4's Add Device screen.",
+      "invalid_account_id": "Not an account ID. Use base64 (12 characters ending in =), 16 hex characters, or the decimal number.",
+      "pair_no_console": "No answer from the PS4. It must be on (not in rest mode) and reachable from Home Assistant.",
+      "pair_resting": "The PS4 is in rest mode. Turn it on, open Add Device, then try again.",
+      "pair_no_search_reply": "The PS4 didn't answer. Is Add Device still open? Open it again and enter the new number.",
+      "pair_no_reply": "The PS4 didn't answer the pairing request in time. Keep Add Device open and try again.",
+      "pair_wrong_pin": "The PS4 refused the number. Check it (it changes every time Add Device opens) and try again.",
+      "pair_invalid_account": "The PS4 doesn't know this account ID. It must belong to a user on this PS4 (PSN sign-in or Apollo activation).",
+      "pair_in_use": "Remote Play is busy on the PS4. Close other Remote Play sessions and try again.",
+      "pair_failed": "Pairing failed. The Home Assistant log has the PS4's reason code."
+    },
+    "abort": {
+      "already_configured": "This PS4 is already set up.",
+      "not_ps4_goldhen_console": "Not a PS4 set up in this integration.",
+      "ip_updated": "The PS4 moved to a new IP address; its entry now uses it."
     }
   },
   "options": {
     "step": {
       "init": {
+        "title": "PS4 GoldHEN",
+        "menu_options": {
+          "settings": "Connection and wake settings",
+          "account": "Pair with the PS4 (Remote Play wake, no chiaki-ng)"
+        }
+      },
+      "settings": {
         "title": "PS4 GoldHEN Settings",
-        "description": "Update the connection settings for your PS4 GoldHEN integration.",
+        "description": "Update the connection settings for your PS4 GoldHEN integration. The wake settings let the PS4 media player turn the console on.",
         "data": {
           "ps4_host": "PS4 IP Address",
-          "binloader_port": "BinLoader Port",
-          "ftp_port": "FTP Port"
+          "regist_key": "Remote Play regist key (wake)",
+          "wake_entity": "Wake entity (optional)"
         },
         "data_description": {
           "ps4_host": "IP address of your PS4 (e.g. 192.168.1.100)",
-          "binloader_port": "BinLoader TCP port (default: 9090)",
-          "ftp_port": "GoldHEN FTP port used to verify connectivity (default: 2121)"
+          "regist_key": "Wakes the PS4 from rest mode over the network. Filled in by \"Pair with the PS4\" in this menu, or paste the 8-character key chiaki-ng got when it paired: `rp_regist_key` in its exported settings file (the @ByteArray(...) line can be pasted as is). Needs rest mode with \"Stay Connected to the Internet\" and \"Enable Turning On PS4 from Network\". Leave empty to turn the network wake off.",
+          "wake_entity": "A button or script that wakes the PS4 another way, e.g. an ESP32 Bluetooth wake. Used when the PS4 is fully off (the network wake only works from rest) or when no regist key is set."
+        }
+      },
+      "account": {
+        "title": "Pair with the PS4 (1 of 2): account",
+        "description": "Pairing lets Home Assistant wake the PS4 at {host} from rest mode, and it needs the account ID of a user on that PS4. Look the ID up first: the pairing screen in the next step has to stay open until pairing finishes.\n\n**No PSN (GoldHEN):** on the PS4 open Apollo Save Tool → **User Tools → Activate PS4 Accounts**. Each user is listed as `USERNAME (account ID)`; the ID is the 16 characters in brackets. If the user isn't activated yet, activate it there (offline account). Don't use the all-zero ID (0000000000000000) Apollo shows prefilled.\n\n**PSN user:** not tested yet. HA also accepts a PSN account ID as base64 (the form chiaki-ng uses) or as the decimal number.",
+        "data": {
+          "account_id": "Account ID"
+        },
+        "data_description": {
+          "account_id": "16 hex characters (Apollo), base64 (12 characters ending in =), or the decimal number. Saved, so the next pairing is pre-filled."
+        }
+      },
+      "pin": {
+        "title": "Pair with the PS4 (2 of 2): number",
+        "description": "On the PS4: **Settings → Remote Play Connection Settings**. Turn on **Enable Remote Play**, then open **Add Device**. Enter the 8-digit number it shows and submit **while that screen is still open**: leaving it, or waiting past its 5 minutes, cancels the pairing.\n\nOn success the new regist key replaces the one saved in the settings.",
+        "data": {
+          "pin": "Number from Add Device"
+        },
+        "data_description": {
+          "pin": "The 8-digit number on the PS4's Add Device screen (spaces are fine)."
         }
       }
     },
     "error": {
-      "ftp_not_reachable": "Cannot reach the PS4 FTP service. Check the IP and ensure GoldHEN is running."
+      "ftp_not_reachable": "Cannot reach the PS4 FTP service. Check the IP, and that GoldHEN is loaded with FTP on.",
+      "invalid_regist_key": "The regist key must be 8 hexadecimal characters (0-9, a-f).",
+      "invalid_pin": "Enter the 8-digit number from the PS4's Add Device screen.",
+      "invalid_account_id": "Not an account ID. Use base64 (12 characters ending in =), 16 hex characters, or the decimal number.",
+      "pair_no_console": "No answer from the PS4. It must be on (not in rest mode) and reachable from Home Assistant.",
+      "pair_resting": "The PS4 is in rest mode. Turn it on, open Add Device, then try again.",
+      "pair_no_search_reply": "The PS4 didn't answer. Is Add Device still open? Open it again and enter the new number.",
+      "pair_no_reply": "The PS4 didn't answer the pairing request in time. Keep Add Device open and try again.",
+      "pair_wrong_pin": "The PS4 refused the number. Check it (it changes every time Add Device opens) and try again.",
+      "pair_invalid_account": "The PS4 doesn't know this account ID. It must belong to a user on this PS4 (PSN sign-in or Apollo activation).",
+      "pair_in_use": "Remote Play is busy on the PS4. Close other Remote Play sessions and try again.",
+      "pair_failed": "Pairing failed. The Home Assistant log has the PS4's reason code."
+    }
+  },
+  "entity": {
+    "sensor": {
+      "status": {
+        "name": "Status",
+        "state": {
+          "playing": "Playing",
+          "home_screen": "Home screen",
+          "rest": "Rest mode",
+          "off": "Off"
+        }
+      },
+      "play_time_today": {
+        "name": "Play time today"
+      },
+      "play_time_7_days": {
+        "name": "Play time last 7 days"
+      },
+      "play_time_30_days": {
+        "name": "Play time last 30 days"
+      },
+      "current_session": {
+        "name": "Current session"
+      },
+      "save_backup_status": {
+        "name": "Save backup status",
+        "state": {
+          "never": "Never backed up",
+          "backing_up": "Backing up",
+          "up_to_date": "Up to date",
+          "limit_reached": "Limit reached",
+          "game_open": "Skipped an open game",
+          "failed": "Failed"
+        }
+      },
+      "last_save_backup": {
+        "name": "Last save backup"
+      }
     }
   }
 }
