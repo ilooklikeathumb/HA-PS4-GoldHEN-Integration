@@ -34,7 +34,7 @@ PS5 tables in `tests/rp_ps5_keys.py`) are byte-for-byte the same as those in chi
 ([chiaki](https://git.sr.ht/~thestr4ng3r/chiaki) by Florian Märkl, continued as
 [chiaki-ng](https://github.com/chiaki-ng/chiaki-ng); AGPL-3.0-only with an OpenSSL exception). They came to this
 project through playactor (above), which added them in March 2021 building on chiaki's work; chiaki published them
-in October 2020. They are Sony's Remote Play key material, which every compatible client has to use unchanged. No
+in October 2020. The console accepts only these exact values, so every compatible client carries them unchanged. No
 chiaki or chiaki-ng source code is used.
 
 ## ps4-payload-dev SDK (GPL-3.0-or-later)

@@ -275,15 +275,16 @@ data, this isn't possible. So thanks, genuinely. GG.
   Enabler is why a console without PSN can pair at all.
 - **[Tech-Morph](https://github.com/Tech-Morph/HA-PS4-GoldHEN-Integration)**: the original integration this fork
   builds on (MIT), and the bundled payload collection.
-- **[Daniel Leong (playactor)](https://github.com/dhleong/playactor)** (ISC): the Remote Play pairing and login are
-  ported from it.
+- **[Daniel Leong (playactor)](https://github.com/dhleong/playactor)** (ISC): HA's Remote Play pairing and login are
+  a Python port of it, so HA pairs with a PS4 without another Remote Play app.
 - **[John Törnblom (ps4-payload-dev SDK)](https://github.com/ps4-payload-dev/sdk)** (GPL-3.0-or-later): builds this
   integration's payloads.
 - **[Bucanero (Apollo Save Tool)](https://github.com/bucanero/apollo-ps4)**: offline accounts, Fake USB restore, save
   names.
 - **[chiaki](https://git.sr.ht/~thestr4ng3r/chiaki)** by Florian Märkl and
-  **[chiaki-ng](https://github.com/chiaki-ng/chiaki-ng)** (AGPL-3.0): the open Remote Play clients this pairing and
-  wake were checked against. No chiaki code is used, but the Remote Play key tables are the same bytes as chiaki's.
+  **[chiaki-ng](https://github.com/chiaki-ng/chiaki-ng)** (AGPL-3.0): the first open Remote Play client and its
+  continuation, which playactor and this integration build on; pairing and wake were checked against chiaki-ng. The key tables match
+  chiaki's (through playactor); no chiaki code is used.
 - **[LightningMods](https://github.com/LightningMods)** (Itemzflow), **[drakmor](https://github.com/drakmor/fan_target)**,
   **Zer0xFF**, **Marice**, OpenOrbis, PS5SX2 and the PS4 Developer Wiki: research the code follows, no code copied.
 
