@@ -1,11 +1,13 @@
-"""Which PS4 a `send_payload` call goes to (no HA imports, for the tests).
+"""Which PS4 and which file a `send_payload` call uses (no HA imports, for the tests).
 
-The call may name a host, but only one of this integration's own consoles; the BinLoader port always comes from that
-console's entry. No host + one console = that console; no host + several = an error, never a guess.
+The call may name a host, but only one of this integration's own consoles; the BinLoader port comes from that
+console's entry unless the call gives one. No host + one console = that console; no host + several = an error, never a
+guess. The file must sit directly inside the payloads folder.
 """
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
+import os
 
 
 def payload_target(
@@ -25,3 +27,18 @@ def payload_target(
     if len(targets) > 1:
         raise ValueError(f"Several PS4s are set up ({', '.join(sorted(targets))}): set ps4_host to pick one")
     return next(iter(targets.items()))
+
+
+def payload_path(payload_dir: str, payload_file: str) -> str:
+    """Full path of a file directly inside payload_dir, given by its name or its full path; ValueError for any other
+    path, `..` or a link that leads outside."""
+    name = (payload_file or "").strip()
+    if os.path.isabs(name):
+        path = os.path.realpath(name)
+    elif name and name not in (".", "..") and os.path.basename(name) == name:
+        path = os.path.realpath(os.path.join(payload_dir, name))
+    else:
+        path = None
+    if path is None or os.path.dirname(path) != os.path.realpath(payload_dir):
+        raise ValueError(f"payload_file must be a file name in {payload_dir} (move the file there and pass its name)")
+    return path

@@ -6,7 +6,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.device_registry import DeviceInfo
 
-from .const import CONF_CONSOLE_NAME, DOMAIN
+from .const import CONF_CONSOLE_NAME, CONF_PS4_HOST, DOMAIN
 
 # The device page's visit link opens the GoldHEN panel (_PANEL_URL_PATH in __init__.py)
 _PANEL_CONFIGURATION_URL = "homeassistant://ps4_goldhen"
@@ -25,6 +25,11 @@ def ps4_device_info(entry: ConfigEntry) -> DeviceInfo:
         manufacturer="Sony Interactive Entertainment",
         configuration_url=_PANEL_CONFIGURATION_URL,
     )
+
+
+def media_player_unique_id(entry: ConfigEntry) -> str:
+    """The console's media player (the panel's Wake / Rest button finds it by this)."""
+    return f"{DOMAIN}_{entry.data[CONF_PS4_HOST]}_media_player"
 
 
 def device_name(hass: HomeAssistant, entry: ConfigEntry) -> str | None:

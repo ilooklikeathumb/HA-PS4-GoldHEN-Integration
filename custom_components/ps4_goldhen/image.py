@@ -1,7 +1,7 @@
 """PS4 GoldHEN image: cover art of the running game.
 
-Same pattern as HA core's playstation_network "Now playing" image. The cover comes from the same sources as the
-media player: Sony's CDN URL from app.db, else the console's icon0.png (disk cache, else FTP).
+Same pattern as HA core's playstation_network "Now playing" image. The cover comes from the same source as the
+media player: the console's own icon0.png (HA's disk cache for this console, else FTP).
 """
 from __future__ import annotations
 
@@ -46,8 +46,9 @@ class PS4GameCoverImage(CoordinatorEntity, ImageEntity):
         self._attr_unique_id = f"{DOMAIN}_{entry.data[CONF_PS4_HOST]}_game_cover"
         self._attr_device_info = ps4_device_info(entry)
         self._entry_data = hass.data[DOMAIN][entry.entry_id]  # updated in place (game_map refreshes)
+        self._console = entry.entry_id
         self._tid: str | None = None
-        self._attr_image_url = None
+        self._attr_image_url = None  # bytes from async_image, never a URL
         self._sync_cover()
 
     def _game_tid(self) -> str | None:
@@ -59,14 +60,11 @@ class PS4GameCoverImage(CoordinatorEntity, ImageEntity):
         return tid.strip().upper() if tid else None
 
     def _sync_cover(self) -> None:
-        """New title or newly known CDN URL → drop the cached image and stamp the change."""
+        """New title → drop the cached image and stamp the change."""
         tid = self._game_tid()
-        cdn = self._entry_data.get("game_map", {}).get(tid, {}).get("cdn_cover") if tid else None
-        url = cdn if cdn and cdn.startswith("http") else None
-        if tid == self._tid and url == self._attr_image_url:
+        if tid == self._tid:
             return
         self._tid = tid
-        self._attr_image_url = url
         self._cached_image = None
         self._attr_image_last_updated = dt_util.utcnow() if tid else None
 
@@ -92,8 +90,6 @@ class PS4GameCoverImage(CoordinatorEntity, ImageEntity):
         tid = self._tid
         if tid is None:
             return None
-        if self._attr_image_url:  # Sony CDN cover from app.db, fetched + cached by ImageEntity
-            return await super().async_image()
         if self._cached_image and tid == self._tid:
             return self._cached_image.content
         data = self._entry_data
@@ -101,7 +97,8 @@ class PS4GameCoverImage(CoordinatorEntity, ImageEntity):
         cover_path = game_info.get("cover") or f"/user/appmeta/{tid}/icon0.png"
         try:  # under the console's FTP lock; a second request for the same cover finds it in the disk cache
             content = await ftp_session.run(
-                self.hass, data, _read_or_fetch_cover, data["host"], int(data["ftp_port"]), tid, cover_path
+                self.hass, data, _read_or_fetch_cover, data["host"], int(data["ftp_port"]), self._console, tid,
+                cover_path,
             )
         except Exception as err:  # noqa: BLE001 — no cover is a normal outcome (e.g. FTP off)
             _LOGGER.debug("Game cover for %s unavailable: %s", tid, err)

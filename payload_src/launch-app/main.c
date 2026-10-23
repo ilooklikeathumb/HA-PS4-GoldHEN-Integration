@@ -22,6 +22,14 @@
  * + wake + Remote Play login: a game resumed at the same spot, twice. Lead from PS5SX2's disc_launch.c notes,
  * which also found SetAppFocus(id, 0) takes the pad away, so it isn't used.
  *   ps4_goldhen launch: resume <title ID> 0x6000520c -> 0x8094000c (user 0x10000001)
+ *
+ * Close one title: a title ID with the close-only flag closes that title, game or app, in front or in the
+ * background. An app is never the big app, so the big-app close leaves it open. The title's app ID comes from
+ * sceLncUtilGetAppId; the kill is the same call as the big-app close, then sceLncUtilKillApp if that one refuses.
+ * Tested on FW 9.03: an app in front with a game suspended behind it (only the app closed, the game resumed in its
+ * own process), an app in the background behind a game, a game in front, and a title that isn't running.
+ *   ps4_goldhen launch: close <title ID> 0x<app> -> 0x<code> (lnc 0x<code>), closed
+ *   ps4_goldhen launch: close <title ID> -> not running (0xffffffff)
  */
 #include <fcntl.h>
 #include <stdarg.h>
@@ -46,6 +54,8 @@ typedef struct {
 
 int sceLncUtilLaunchApp(const char *, const char **, LncAppParam *);
 int sceLncUtilGetAppTitleId(int, char *); // 16-byte buffer, as the Itemzflow daemon calls it
+int sceLncUtilGetAppId(const char *);
+int sceLncUtilKillApp(uint32_t);
 int sceSystemServiceGetAppIdOfBigApp(void);
 int sceSystemServiceKillApp(uint32_t, int, int, int);
 int sceUserServiceInitialize(void *);
@@ -53,8 +63,8 @@ int sceUserServiceGetLoginUserIdList(UserServiceLoginUserIdList *);
 int sceUserServiceGetForegroundUser(int32_t *);
 
 // HA replaces this marker: bytes 0-9 = title ID + NUL (all NUL = no title), byte 10 = 'K' to close the running game
-// first (never the picked one, see above), or 'R' (no title) = resume the suspended game only. Volatile so the
-// compiler never folds the marker into the code.
+// first (never the picked one, see above), 'R' (no title) = resume the suspended game only, or 'C' = close this
+// title only (nothing launched). Volatile so the compiler never folds the marker into the code.
 volatile char title_id[16] = "PS4GH_TITLE_ID_";
 
 #define KILL_NEEDED 0x80940010     // another game is running
@@ -107,6 +117,31 @@ close_running_game(void) {
   for(int i = 0; i < 40 && sceSystemServiceGetAppIdOfBigApp() == app; i++) {
     usleep(250000);
   }
+}
+
+// Close one title by title ID, game or app; wait up to 10 s for it to go. Unsaved progress is lost.
+// Never a system title: the Internet Browser (NPXS20102) runs inside the home screen's app (NPXS20001), so its
+// app ID is the home screen's.
+static int
+close_title(const char *tid) {
+  if(!strncmp(tid, "NPXS", 4)) {
+    say("ps4_goldhen launch: close %s -> system title, not closed", tid);
+    return 1;
+  }
+  int app = sceLncUtilGetAppId(tid);
+  if(!is_game(app)) { // games and apps both have 0x60… app IDs
+    say("ps4_goldhen launch: close %s -> not running (0x%08x)", tid, app);
+    return 0;
+  }
+  int ret = sceSystemServiceKillApp(app, -1, 0, 0);
+  int lnc = ret ? sceLncUtilKillApp(app) : 0;
+  for(int i = 0; i < 40 && sceLncUtilGetAppId(tid) == app; i++) {
+    usleep(250000);
+  }
+  int gone = sceLncUtilGetAppId(tid) != app;
+  say("ps4_goldhen launch: close %s 0x%08x -> 0x%08x (lnc 0x%08x), %s", tid, app, ret, lnc,
+      gone ? "closed" : "still running");
+  return !gone;
 }
 
 static int
@@ -174,6 +209,7 @@ main(void) {
   tid[15] = '\0';
   int close_first = tid[10] == 'K';
   int resume_only = tid[10] == 'R';
+  int close_only = tid[10] == 'C';
 
   int big = sceSystemServiceGetAppIdOfBigApp();
   memset(big_tid, 0, sizeof(big_tid));
@@ -193,6 +229,9 @@ main(void) {
     }
     say("ps4_goldhen launch: no title ID in the payload, nothing launched");
     return 1;
+  }
+  if(close_only) {
+    return close_title(tid);
   }
   if(big_known && !strcmp(big_tid, tid)) {
     return resume_app(big, tid); // the picked game is the suspended one: never close it

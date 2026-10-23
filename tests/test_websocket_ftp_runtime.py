@@ -75,6 +75,18 @@ class FTPHandlerTests(unittest.IsolatedAsyncioTestCase):
         await self.exercise('ws_get_text','_ftp_get_text',{'path':'/a'},'example',{'content':'example'})
     async def test_put_text(self):
         await self.exercise('ws_put_text','_ftp_put_text',{'path':'/a','content':'example'},None,{'success':True})
+    async def test_a_sleeping_console_gets_no_ftp(self):
+        for power in ('rest','off'):
+            self.hass.data['ps4_goldhen']['entry']['coordinator']=SimpleNamespace(data={'power_state':power})
+            for handler,helper,msg in (('ws_list_dir','_ftp_list_dir',{'path':'/'}),('ws_put_text','_ftp_put_text',{'path':'/a','content':'x'})):
+                c=Connection()
+                with patch.object(self.ws,helper) as call:
+                    await getattr(self.ws,handler)(self.hass,c,{'id':1,'entry_id':'entry',**msg})
+                call.assert_not_called()
+                self.assertEqual(c.errors[0][1],'console_asleep')
+                self.assertIn('rest mode or off: turn it on first',c.errors[0][2])
+        self.hass.data['ps4_goldhen']['entry']['coordinator']=SimpleNamespace(data={'power_state':None})
+        await self.exercise('ws_list_dir','_ftp_list_dir',{'path':'/'},[],{'path':'/','entries':[]})  # unknown still tries
     def test_asyncio_is_imported_by_module(self):
         self.assertIs(self.ws.asyncio,asyncio)
 

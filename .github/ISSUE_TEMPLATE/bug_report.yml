@@ -44,7 +44,7 @@ body:
     attributes:
       label: Integration and Home Assistant versions
       description: Integration version from HACS (or `manifest.json`); HA version from Settings → About.
-      placeholder: 1.0.0 / 2026.10.1
+      placeholder: 1.1.0 / 2026.10.1
     validations:
       required: true
   - type: textarea

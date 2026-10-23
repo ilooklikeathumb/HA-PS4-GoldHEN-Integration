@@ -12,6 +12,7 @@ the console's firmware.
 A successful send means BinLoader (port 9090) received the file, not that the payload ran.
 
 The integration doesn't need any of these: rest mode, launch / close, temperatures, fan and console info use its own
-payloads (main README → Payloads). To add your own, put a `.bin` or `.elf` in `/config/ps4/payloads`.
+payloads ([docs/USAGE.md → Payloads](../../../docs/USAGE.md#payloads)). To add your own, put a `.bin` or `.elf` in
+`/config/ps4/payloads`.
 
 [Back to the main README](../../../README.md)

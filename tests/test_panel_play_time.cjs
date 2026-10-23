@@ -61,7 +61,7 @@ async function main() {
     assert.match(p.shadowRoot.innerHTML, /data-tab="playtime">Play time</);
     // tab order
     assert.deepEqual([...p.shadowRoot.innerHTML.matchAll(/data-tab="(\w+)"/g)].map((m) => m[1]),
-                     ['ftp', 'binloader', 'klog', 'saves', 'screenshots', 'playtime']);
+                     ['games', 'saves', 'screenshots', 'playtime', 'ftp', 'binloader', 'klog']);
     p._tab = 'playtime';
     await p._ptLoad();
     const html = p.shadowRoot.innerHTML;

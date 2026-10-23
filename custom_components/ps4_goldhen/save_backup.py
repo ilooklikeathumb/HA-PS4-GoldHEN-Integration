@@ -12,7 +12,8 @@ Torn-copy guard for the rest: the title folder is listed again right after its s
 rewritten meanwhile is dropped and waits.
 
 A pass runs only when asked: Back up now (panel, device page button, or the user's own automation). There is no
-automatic mode: anyone who wants one writes an automation. The open-game check reads
+automatic mode: anyone who wants one writes an automation. The panel's Stop ends a pass after the save it's copying:
+what it copied stays, and the next pass copies the rest. The open-game check reads
 game_session.py. Every FTP session takes the entry's FTP lock (ftp_session.py) and fetches at most 12 slots
 (24 files), so the cover fetch and the panel's FTP actions get a turn.
 
@@ -41,6 +42,7 @@ import logging
 from pathlib import Path
 import re
 import shutil
+import threading
 import time
 from typing import Any, Callable
 from urllib.parse import quote
@@ -89,7 +91,9 @@ STATUS_UP_TO_DATE = "up_to_date"
 STATUS_LIMIT = "limit_reached"
 STATUS_GAME_OPEN = "game_open"  # the last pass skipped a game that was open then (it may be closed by now)
 STATUS_FAILED = "failed"
-STATUS_OPTIONS = [STATUS_NEVER, STATUS_BACKING_UP, STATUS_UP_TO_DATE, STATUS_LIMIT, STATUS_GAME_OPEN, STATUS_FAILED]
+STATUS_STOPPED = "stopped"  # Stop ended the last pass before it copied everything
+STATUS_OPTIONS = [STATUS_NEVER, STATUS_BACKING_UP, STATUS_UP_TO_DATE, STATUS_LIMIT, STATUS_GAME_OPEN, STATUS_FAILED,
+                  STATUS_STOPPED]
 
 _STORE_VERSION = 1
 _DEFAULTS: dict[str, Any] = {
@@ -97,6 +101,9 @@ _DEFAULTS: dict[str, Any] = {
     "users": {},       # user ID → folder name, fixed when first seen (renaming the user doesn't split the copies)
     "last": None, "last_success": None,
     "sent": None,      # what HA last put in this console's Fake USB folder: {when, from, games, bytes}
+    # The files HA uploaded there and hasn't deleted, recorded before the first upload; the only files Remove from PS4
+    # (or the next send) deletes. None = saved before this list was kept: `sent` names them.
+    "fake_usb_files": None,
 }
 _ZIP_RE = re.compile(r'^[^/\\\x00-\x1f"]{1,200}\.zip$')
 
@@ -108,6 +115,7 @@ class _Runtime:
     settings: dict[str, Any]
     op_lock: asyncio.Lock = field(default_factory=asyncio.Lock)  # one pass at a time per console
     running: bool = False
+    stop: threading.Event = field(default_factory=threading.Event)  # Stop pressed: the pass ends after this save
     progress: dict[str, int] = field(default_factory=lambda: {"done": 0, "total": 0})
     usage: dict[str, int] = field(default_factory=lambda: {"bytes": 0, "versions": 0})
     # The last console read: {mono, read_at, users: {uid: {title: {slot: info}}}, meta: {uid: save
@@ -188,6 +196,7 @@ async def async_setup(hass: HomeAssistant, entry: ConfigEntry, coordinator) -> N
         _pin_folder(hass, rt)  # Manual by default: the folder is fixed on the first start
         await rt.store.async_save(rt.settings)
     if rt.settings["folder"]:
+        await _async_repair(hass, rt)  # an HA stop or crash mid-install is followed by this start
         await _async_rescan(hass, rt)
     await hass.async_add_executor_job(sf.prune_downloads, downloads_dir(hass, entry.entry_id), ZIP_MAX_AGE_S, time.time())
     _register_once(hass)
@@ -282,8 +291,17 @@ def _room(console: Path, limit: int) -> int:
     return min(limit - sf.usage(console)["bytes"], sf.disk_room(console, MIN_FREE_BYTES))
 
 
-def _fetch(ftp: ftplib.FTP, uid: str, tid: str, chunk: list[dict[str, Any]], staging: Path) -> tuple[list, dict]:
-    staged = [(t["slot"], t["info"], sf.fetch_slot(ftp, uid, tid, t["slot"], t["info"], staging)) for t in chunk]
+def _fetch(ftp: ftplib.FTP, uid: str, tid: str, chunk: list[dict[str, Any]], staging: Path,
+           stop: threading.Event) -> tuple[list, dict]:
+    """Download the chunk's slots, each after the History versions picked to make room for it are deleted. Once Stop
+    is pressed no new slot starts: a stopped pass never deletes a version for a save it didn't copy."""
+    staged = []
+    for t in chunk:
+        if stop.is_set():
+            break
+        for version in t.get("make_room", ()):
+            sf.delete_version(version)
+        staged.append((t["slot"], t["info"], sf.fetch_slot(ftp, uid, tid, t["slot"], t["info"], staging)))
     return staged, sf.list_slots(ftp, uid, tid)  # listed again: did the game write while we copied?
 
 
@@ -325,16 +343,20 @@ async def _async_backup(hass: HomeAssistant, rt: _Runtime, titles: set[str] | No
     game_map = hass.data[DOMAIN][entry_id].get("game_map", {})
     tz = dt_util.get_default_time_zone()
     rt.running, rt.progress = True, {"done": 0, "total": 0}
+    rt.stop.clear()
     async_dispatcher_send(hass, signal(entry_id))
-    result: dict[str, Any] = {"checked": 0, "copied": 0, "skipped": 0, "retried": 0, "already": 0, "open": []}
+    result: dict[str, Any] = {"checked": 0, "copied": 0, "skipped": 0, "retried": 0, "already": 0, "open": [],
+                              "left": 0}
     opened: set[str] = set()  # changed but open on the console: skipped, never copied
     error: str | None = None
+    left = 0  # saves that fit but weren't reached yet
     try:
         walk = await session(hass, entry_id, partial(_walk, titles=titles, known=set(rt.settings["users"])))
         _assign_user_folders(rt, walk["names"])
         _remember(rt, walk, titles)
         users = rt.settings["users"]
         found = walk["found"]
+        await _async_repair(hass, rt)
         todo = await hass.async_add_executor_job(_changed, console, users, found)
         todo = [t for t in todo if _in_scope(picks, t["uid"], t["title"], t["slot"])]
         result["checked"] = sum(1 for uid, tid, slots in found for slot in slots if _in_scope(picks, uid, tid, slot))
@@ -358,7 +380,7 @@ async def _async_backup(hass: HomeAssistant, rt: _Runtime, titles: set[str] | No
                 if picked is None:  # this one can't fit; a smaller one after it still may
                     result["skipped"] += 1
                     continue
-                await hass.async_add_executor_job(lambda: [sf.delete_version(v) for v in picked])
+                item["make_room"] = picked  # deleted right before this save is copied (_fetch)
                 pool = [v for v in pool if v not in picked]
                 room += sum(v["bytes"] for v in picked)
             room -= need
@@ -367,22 +389,29 @@ async def _async_backup(hass: HomeAssistant, rt: _Runtime, titles: set[str] | No
         groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
         for item in fits:
             groups.setdefault((item["uid"], item["title"]), []).append(item)
+        left = len(fits)
         for (uid, tid), items in groups.items():
+            if rt.stop.is_set():
+                break
             if tid in _open_titles(hass, entry_id):  # started during the pass
                 opened.add(tid)
                 rt.progress["done"] += len(items)
+                left -= len(items)
                 continue
             label = _game(tid, game_map, sf.game_names(walk["meta"].get(uid, {})))
             for start in range(0, len(items), SLOTS_PER_SESSION):
+                if rt.stop.is_set():
+                    break
                 chunk = items[start:start + SLOTS_PER_SESSION]
-                staged, after = await session(
-                    hass, entry_id, partial(_fetch, uid=uid, tid=tid, chunk=chunk, staging=console / sf.STAGING))
+                staged, after = await session(hass, entry_id, partial(
+                    _fetch, uid=uid, tid=tid, chunk=chunk, staging=console / sf.STAGING, stop=rt.stop))
                 now = dt_util.now().replace(tzinfo=None)
                 made, again = await hass.async_add_executor_job(
                     _install, console / users[uid], tid, staged, after, label, tz, now)
                 result["copied"] += made
                 result["retried"] += again
-                rt.progress["done"] += len(chunk)
+                rt.progress["done"] += len(staged)
+                left -= len(staged)
                 await _async_rescan(hass, rt)  # the panel's "X of N GB" grows as copies land
                 async_dispatcher_send(hass, signal(entry_id))
         await hass.async_add_executor_job(_name_copies, console, dict(users), walk)
@@ -392,9 +421,12 @@ async def _async_backup(hass: HomeAssistant, rt: _Runtime, titles: set[str] | No
     finally:
         await hass.async_add_executor_job(partial(shutil.rmtree, console / sf.STAGING, ignore_errors=True))
         rt.running = False
+        stopped = rt.stop.is_set() and left > 0
+        rt.stop.clear()
         result["open"] = sorted(cf.game_folder(t, game_map) for t in opened)
-        state =(STATUS_FAILED if error else STATUS_LIMIT if result["skipped"] else STATUS_GAME_OPEN if opened
-                 else STATUS_UP_TO_DATE)
+        result["left"] = left if stopped else 0
+        state = (STATUS_FAILED if error else STATUS_STOPPED if stopped else STATUS_LIMIT if result["skipped"]
+                 else STATUS_GAME_OPEN if opened else STATUS_UP_TO_DATE)
         finished = dt_util.utcnow().isoformat()
         rt.settings["last"] = {"state": state, "finished": finished, "scope": sorted(titles) if titles else "all",
                                "error": error, **result}
@@ -406,6 +438,17 @@ async def _async_backup(hass: HomeAssistant, rt: _Runtime, titles: set[str] | No
 
 
 # ── Shared steps ───────────────────────────────────────────────────────────────
+
+async def _async_repair(hass: HomeAssistant, rt: _Runtime) -> None:
+    """Whole pairs only: a copy cut short by an HA stop or crash between install()'s renames gets finished or dropped."""
+    console = console_dir(hass, rt)
+    users = list(rt.settings["users"].values())
+    fixed = await hass.async_add_executor_job(
+        lambda: sum(sf.repair_half_pairs(console / folder) for folder in users)) if console else 0
+    if fixed:
+        _LOGGER.warning("Save backup for %s: repaired %d file(s) an interrupted backup left half copied",
+                        hass.data[DOMAIN][rt.entry.entry_id].get("host"), fixed)
+
 
 async def _async_rescan(hass: HomeAssistant, rt: _Runtime) -> None:
     folder = console_dir(hass, rt)
@@ -454,10 +497,14 @@ def _item(item: dict[str, Any]) -> tuple[str, str | None, str | None]:
     return tid, slot, stamp  # type: ignore[return-value]
 
 
-def _backup_scope(uid: str | None, items: list[dict[str, Any]] | None
+def _backup_scope(uid: str | None, items: list[dict[str, Any]] | None, title_id: str | None = None
                   ) -> tuple[set[str] | None, set[tuple[str, str, str | None]] | None]:
-    """The ticked saves on the PS4 pane (one user) → the titles to walk + (uid, title, slot or None) picks. No items:
-    everything."""
+    """The ticked saves on the PS4 pane (one user) → the titles to walk + (uid, title, slot or None) picks. `title_id`
+    (the game page): that game's saves of every user. Neither: everything."""
+    if title_id is not None:
+        if not sf.valid_title(title_id):
+            raise HomeAssistantError("Unknown game")
+        return {title_id}, None
     if not items:
         return None, None
     if not sf.valid_user(uid):
@@ -472,11 +519,11 @@ def _backup_scope(uid: str | None, items: list[dict[str, Any]] | None
 
 
 async def async_start_backup(hass: HomeAssistant, entry_id: str, uid: str | None = None,
-                             items: list[dict[str, Any]] | None = None) -> None:
-    """Button / panel: a pass in the background (it outlives the panel). Everything, or the saves ticked on the PS4
-    pane."""
+                             items: list[dict[str, Any]] | None = None, title_id: str | None = None) -> None:
+    """Button / panel: a pass in the background (it outlives the panel). Everything, the saves ticked on the PS4
+    pane, or one game (the game page)."""
     rt = _require(hass, entry_id)
-    titles, picks = _backup_scope(uid, items)
+    titles, picks = _backup_scope(uid, items, title_id)
     if _power(hass, entry_id) in (POWER_REST, POWER_OFF):
         raise HomeAssistantError("The PS4 is in rest mode or off: turn it on first (HA doesn't use FTP on a sleeping PS4)")
     _check_free(rt)
@@ -491,6 +538,14 @@ async def async_start_backup(hass: HomeAssistant, entry_id: str, uid: str | None
             rt.op_lock.release()
 
     rt.entry.async_create_background_task(hass, _run(), f"{DOMAIN}_saves_backup")
+
+
+async def async_stop_backup(hass: HomeAssistant, entry_id: str) -> None:
+    """Panel Stop: the pass ends after the save it's copying (no half file on either side); what it copied stays."""
+    rt = _require(hass, entry_id)
+    if not rt.running:
+        raise HomeAssistantError("No save backup is running for this PS4")
+    rt.stop.set()
 
 
 def _user_dir(hass: HomeAssistant, rt: _Runtime, uid: str) -> Path:
@@ -620,11 +675,21 @@ def _save_names(user_dir: Path, picks: list[tuple[str, str, str | None]]) -> lis
     return out
 
 
+def _fake_usb_files(rt: _Runtime) -> list[str]:
+    files = rt.settings.get("fake_usb_files")
+    return list(files) if files is not None else sf.sent_files(rt.settings.get("sent"))
+
+
+def _clear_and_list(ftp: ftplib.FTP, files: list[str], check: list[str]) -> tuple[int, dict[str, list[str]], list[str]]:
+    """Delete HA's earlier files, then read what's left in the folder and which of `check` it already holds."""
+    return sf.clear_fake_usb(ftp, files), sf.list_fake_usb(ftp), sf.fake_usb_taken(ftp, check)
+
+
 async def async_send(hass: HomeAssistant, entry_id: str, uid: str, items: list[dict[str, Any]] | None = None,
                      target: str | None = None) -> dict[str, Any]:
     """Restore, step 1: put HA's copies of the ticked saves (or every game's newest) into Apollo's Fake USB folder on a
-    PS4 (this one or another in HA), replacing what HA sent there before. Step 2 is on the console: Apollo → USB Saves
-    → Copy save game to HDD."""
+    PS4 (this one or another in HA), replacing what HA sent there before. Files HA didn't send stay; a send that would
+    write over one is refused. Step 2 is on the console: Apollo → USB Saves → Copy save game to HDD."""
     rt = _require(hass, entry_id)
     target = target or entry_id
     trt = _awake_target(hass, target)
@@ -636,16 +701,28 @@ async def async_send(hass: HomeAssistant, entry_id: str, uid: str, items: list[d
     game_map = hass.data[DOMAIN][entry_id].get("game_map", {})
     names = await hass.async_add_executor_job(_game_names, user_dir, _console_meta(rt))
     saves = await hass.async_add_executor_job(_save_names, user_dir, picks)
+    remotes = sf.fake_usb_paths(members)
     sent = 0
     async with trt.op_lock:
         try:
+            trt.settings["fake_usb_files"] = _fake_usb_files(trt)  # before `sent` goes: a record from before the list
             trt.settings["sent"] = None
-            await session(hass, target, sf.clear_fake_usb)
+            _, there, taken = await session(hass, target, partial(
+                _clear_and_list, files=trt.settings["fake_usb_files"], check=remotes))
+            trt.settings["fake_usb_files"] = []
+            if taken:  # checked before the record: a refused send never deletes these
+                names = ", ".join(r.removeprefix(sf.FAKE_USB_SAVES + "/") for r in taken[:3])
+                more = f" and {len(taken) - 3} more" if len(taken) > 3 else ""
+                raise FileExistsError(f"The PS4's Fake USB folder already holds {names}{more}, not sent by HA: move or"
+                                      f" delete {'it' if len(taken) == 1 else 'them'} on the console first")
+            trt.settings["fake_usb_files"] = remotes  # before the first upload: a crash mid-send still knows them
+            await _async_save(hass, trt)
             for group in by_title.values():  # one FTP session per game: the cover fetch gets a turn
                 sent += await session(hass, target, partial(sf.send_to_fake_usb, members=group))
         except (*ftplib.all_errors, OSError, ValueError) as err:
             with contextlib.suppress(*ftplib.all_errors, OSError):  # never leave half a save behind for Apollo
-                await session(hass, target, sf.clear_fake_usb)
+                await session(hass, target, partial(sf.clear_fake_usb, files=_fake_usb_files(trt)))
+                trt.settings["fake_usb_files"] = []
             await _async_save(hass, trt)
             raise HomeAssistantError(f"Send to PS4 stopped: {err or type(err).__name__}") from err
         trt.settings["sent"] = {
@@ -654,23 +731,26 @@ async def async_send(hass: HomeAssistant, entry_id: str, uid: str, items: list[d
             "version": picks[0][2] if len(picks) == 1 else None, "files": len(members), "bytes": sent,
             "saves": saves,
         }
-        if trt.console is not None:  # what's there now: exactly this send
-            trt.console["fake_usb"] = {t: sorted(s for tt, s, _ in picks if tt == t) for t in by_title}
+        if trt.console is not None:  # what's there now: what HA didn't send, plus this send
+            trt.console["fake_usb"] = {**there, **{
+                t: sorted({*there.get(t, ()), *(s for tt, s, _ in picks if tt == t)}) for t in by_title}}
         await _async_save(hass, trt)
     return {"target": device_name(hass, trt.entry), **trt.settings["sent"]}
 
 
 async def async_clear_sent(hass: HomeAssistant, target: str) -> int:
-    """Remove from PS4: delete what HA put in that console's Fake USB folder."""
+    """Remove from PS4: delete what HA put in that console's Fake USB folder (only that)."""
     trt = _awake_target(hass, target)
     async with trt.op_lock:
         try:
-            deleted = await session(hass, target, sf.clear_fake_usb)
+            deleted, there, _ = await session(hass, target, partial(
+                _clear_and_list, files=_fake_usb_files(trt), check=[]))
         except (*ftplib.all_errors, OSError) as err:
             raise HomeAssistantError(f"Couldn't clear the PS4's Fake USB folder: {err or type(err).__name__}") from err
         trt.settings["sent"] = None
+        trt.settings["fake_usb_files"] = []
         if trt.console is not None:
-            trt.console["fake_usb"] = {}
+            trt.console["fake_usb"] = there
         await _async_save(hass, trt)
     return deleted
 
@@ -834,7 +914,8 @@ def settings_view(hass: HomeAssistant, rt: _Runtime) -> dict[str, Any]:
         "mode": rt.settings["mode"], "limit_gb": rt.settings["limit_gb"],
         "limit_min_gb": LIMIT_MIN_GB, "limit_max_gb": LIMIT_MAX_GB,
         "folder": str(folder) if folder else None, "usage": rt.usage, "running": rt.running,
-        "progress": rt.progress, "last": rt.settings["last"], "last_success": rt.settings["last_success"],
+        "stopping": rt.running and rt.stop.is_set(), "progress": rt.progress, "last": rt.settings["last"],
+        "last_success": rt.settings["last_success"],
         "status": status(rt), "power_state": _power(hass, rt.entry.entry_id),
         "sent": rt.settings["sent"],
     }
@@ -878,8 +959,13 @@ async def _ws_console(hass: HomeAssistant, msg: dict) -> dict[str, Any]:
 
 
 async def _ws_backup(hass: HomeAssistant, msg: dict) -> dict[str, Any]:
-    await async_start_backup(hass, msg["entry_id"], msg.get("uid"), msg.get("items"))
+    await async_start_backup(hass, msg["entry_id"], msg.get("uid"), msg.get("items"), msg.get("title_id"))
     return {"started": True}
+
+
+async def _ws_stop(hass: HomeAssistant, msg: dict) -> dict[str, Any]:
+    await async_stop_backup(hass, msg["entry_id"])
+    return {"stopping": True}
 
 
 async def _ws_keep(hass: HomeAssistant, msg: dict) -> dict[str, Any]:
@@ -917,7 +1003,8 @@ _COMMANDS = (
     _cmd({vol.Required("type"): "ps4_goldhen/saves/list", **_ENTRY}, _ws_list),
     _cmd({vol.Required("type"): "ps4_goldhen/saves/console", **_ENTRY, vol.Optional("refresh"): bool}, _ws_console),
     _cmd({vol.Required("type"): "ps4_goldhen/saves/backup", **_ENTRY, vol.Optional("uid"): str,
-          vol.Optional("items"): _ITEMS}, _ws_backup),
+          vol.Optional("items"): _ITEMS, vol.Optional("title_id"): str}, _ws_backup),
+    _cmd({vol.Required("type"): "ps4_goldhen/saves/stop", **_ENTRY}, _ws_stop),
     _cmd({
         vol.Required("type"): "ps4_goldhen/saves/keep", **_ENTRY, vol.Required("uid"): str,
         vol.Required("title_id"): str, vol.Required("slot"): str, vol.Required("stamp"): str,

@@ -88,8 +88,13 @@ def _dirs(ftp: ftplib.FTP, path: str) -> list[dict[str, Any]]:
         return []
 
 
-def list_buckets(ftp: ftplib.FTP) -> list[dict[str, Any]]:
-    """Every bucket folder with its mtime: 1 listing + 1 per app + 1 per game."""
+def list_buckets(ftp: ftplib.FTP, title_id: str | None = None) -> list[dict[str, Any]]:
+    """Every bucket folder with its mtime: 1 listing + 1 per app + 1 per game. With `title_id`, only that game's:
+    1 listing + 1 per app (an app without the game answers 550)."""
+    if title_id is not None:
+        if not _SEGMENT_RE.match(title_id):
+            return []
+        return [b for app in _dirs(ftp, PHOTO_ROOT) for b in _dirs(ftp, f"{app['path']}/{title_id}")]
     return [b for app in _dirs(ftp, PHOTO_ROOT) for game in _dirs(ftp, app["path"]) for b in _dirs(ftp, game["path"])]
 
 
@@ -126,9 +131,10 @@ def _newest_first(shots: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(shots, key=lambda s: (s["modified_utc"] or "", s["name"]), reverse=True)
 
 
-def newest_shots(ftp: ftplib.FTP, count: int) -> list[dict[str, Any]]:
-    """The newest `count` shots, listing only the buckets that can hold them (a bucket without an mtime is listed)."""
-    buckets = sorted(list_buckets(ftp), key=lambda b: b["modified_utc"] or "~", reverse=True)
+def newest_shots(ftp: ftplib.FTP, count: int, title_id: str | None = None) -> list[dict[str, Any]]:
+    """The newest `count` shots (of one game with `title_id`), listing only the buckets that can hold them (a bucket
+    without an mtime is listed)."""
+    buckets = sorted(list_buckets(ftp, title_id), key=lambda b: b["modified_utc"] or "~", reverse=True)
     shots: list[dict[str, Any]] = []
     for bucket in buckets:
         if len(shots) >= count:
@@ -139,8 +145,8 @@ def newest_shots(ftp: ftplib.FTP, count: int) -> list[dict[str, Any]]:
     return shots[:count]
 
 
-def all_shots(ftp: ftplib.FTP) -> list[dict[str, Any]]:
-    return _newest_first([s for b in list_buckets(ftp) for s in shots_in_bucket(ftp, b["path"])])
+def all_shots(ftp: ftplib.FTP, title_id: str | None = None) -> list[dict[str, Any]]:
+    return _newest_first([s for b in list_buckets(ftp, title_id) for s in shots_in_bucket(ftp, b["path"])])
 
 
 def shot_by_rel(ftp: ftplib.FTP, rel: str) -> dict[str, Any] | None:

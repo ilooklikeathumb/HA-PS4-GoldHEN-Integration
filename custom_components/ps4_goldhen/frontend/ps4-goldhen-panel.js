@@ -7,7 +7,9 @@ class PS4GoldHENPanel extends HTMLElement {
     if (!this._initialized) {
       this._initialized = true;
       this._init();
+      return;
     }
+    this._pwFollow();
   }
 
   set panel(panel) {
@@ -27,7 +29,7 @@ class PS4GoldHENPanel extends HTMLElement {
 
     this._initialized = false;
     this._loading = false;
-    this._tab = "ftp";
+    this._tab = "games";
 
     this._entries = [];
     this._selectedEntryId = null;
@@ -36,6 +38,7 @@ class PS4GoldHENPanel extends HTMLElement {
     this._path = "/";
     this._ftpEntries = [];
     this._ftpError = "";
+    this._ftpListed = false;
     this._editing = null;
 
     // BinLoader state
@@ -72,6 +75,15 @@ class PS4GoldHENPanel extends HTMLElement {
 
     // Saves state
     this._svReset();
+
+    // Games state
+    this._gmTimer = null;  // 1 s while a backup / sync started here runs
+    this._gmTick = null;   // once a minute while a game's page is open: its session time
+    this._gmReset();
+
+    // Wake / Rest state
+    this._pwReset();
+    this._pwSig = "";
   }
 
   connectedCallback() {
@@ -88,6 +100,7 @@ class PS4GoldHENPanel extends HTMLElement {
     this._ssStopPoll();
     this._ptStopPoll();
     this._svStopPoll();
+    this._gmStopPoll();
   }
 
   // the console's name in HA (the user's rename first), else the entry title
@@ -95,14 +108,17 @@ class PS4GoldHENPanel extends HTMLElement {
     return entry?.name || entry?.title || entry?.ps4_host || "";
   }
 
-  // Escape or a click on the dark backdrop closes the topmost viewer / dialog. The FTP editor is
-  // left alone: it may hold unsaved text.
+  // Escape or a click on the dark backdrop closes the topmost viewer / dialog; Escape on a game's page goes back to
+  // the covers. The FTP editor is left alone: it may hold unsaved text.
   _closeOverlay() {
-    if (this._plConfirm) this._plConfirm = null;
+    if (this._pw.confirm) this._pw.confirm = false;
+    else if (this._plConfirm) this._plConfirm = null;
     else if (this._svConfirm) this._svConfirm = null;
+    else if (this._gm.confirm) this._gm.confirm = null;
     else if (this._ssDelete) this._ssDelete = null;
     else if (this._ssDialog) this._ssDialog = null;
     else if (this._ssView) this._ssView = null;
+    else if (this._tab === "games" && this._gm.open) this._gmClose();
     else return false;
     this._render();
     return true;
@@ -122,16 +138,143 @@ class PS4GoldHENPanel extends HTMLElement {
     return name && name !== titleId ? `${this._escapeHtml(name)}${tid}` : `Unknown game${tid}`;
   }
 
+  // the panel opens on Games (HA only); the FTP tab lists the PS4 when it's opened
   async _init() {
     await this._loadEntries();
     await this._loadPayloads();
-    if (this._selectedEntryId) await this._loadDir("/");
     this._render();
+    await this._gmLoad();
   }
 
   _setLoading(v) {
     this._loading = v;
     this._render();
+  }
+
+  // ── Wake / Rest (top bar) ──
+  // The selected console's media player, read from the states HA already pushes to the panel (no extra call). Its
+  // turn_on / turn_off are the dashboard's: Wake needs a wake method in the options, Rest sends the rest payload.
+
+  _pwReset() {
+    if (this._pw?.timer) clearTimeout(this._pw.timer);
+    this._pw = { busy: null, want: null, error: "", confirm: false, timer: null };
+  }
+
+  _pwState() {
+    const eid = this._selectedEntry()?.media_player;
+    const st = eid && this._hass?.states?.[eid];
+    if (!st || st.state === "unavailable") return null;
+    const features = st.attributes.supported_features || 0;
+    return {
+      eid, power: st.attributes.power_state || null, playing: st.state === "playing",
+      notResponding: st.attributes.not_responding === true,  // on, but klog silent and no DDP reply (frozen)
+      game: st.attributes.media_title || "", canWake: (features & 128) !== 0, canRest: (features & 256) !== 0,
+      // the title in front (game or app) for Content: its PLAYING badge, Launch / Close
+      tid: st.attributes.media_content_id || "", type: st.attributes.media_content_type || "",
+      picture: st.attributes.entity_picture || "",
+    };
+  }
+
+  // HA pushes every state change in the house: this renders only when the selected console's power changes. The
+  // tabs that use no FTP on a sleeping console follow it too (Refresh comes back once it wakes).
+  _pwFollow() {
+    const st = this._pwState();
+    const sig = st ? `${st.power}|${st.notResponding}|${st.playing}|${st.game}|${st.tid}|${st.canWake}|${st.canRest}` : "";
+    if (sig === this._pwSig) return;
+    this._pwSig = sig;
+    const pw = this._pw;
+    if (pw.busy && pw.want && st?.power === pw.want) {
+      clearTimeout(pw.timer);
+      pw.busy = null;
+    }
+    if (st?.power) {
+      if (this._ssSettings) this._ssSettings = { ...this._ssSettings, power_state: st.power };
+      if (this._svSettings) this._svSettings = { ...this._svSettings, power_state: st.power };
+    }
+    if (this._ftpAsleep()) {  // what was listed can't be opened now
+      this._ftpEntries = [];
+      this._ftpListed = false;
+    }
+    // not mid-typing: a render would drop the editor's text or the focus
+    const focused = this.shadowRoot.activeElement;
+    if (this._editing || (focused && /^(INPUT|TEXTAREA|SELECT)$/.test(focused.tagName))) return;
+    this._render();
+  }
+
+  _renderPower() {
+    const st = this._pwState();
+    if (!st) return "";
+    const { busy, error } = this._pw;
+    const label = st.notResponding ? "Not responding"
+      : { on: st.playing ? "Playing" : "On", rest: "Rest mode", off: "Off" }[st.power] || "Unknown";
+    const dot = st.notResponding ? "unknown" : { on: "on", rest: "rest", off: "off" }[st.power] || "unknown";
+    let button = "";
+    if (busy) button = `<button class="btn" disabled>${busy === "wake" ? "Waking..." : "Going to rest..."}</button>`;
+    else if (st.notResponding) button = "";  // neither works on a frozen console
+    else if (st.power === "on" && st.canRest) button = `<button class="btn" id="btn-power" data-power="rest">Rest</button>`;
+    else if (st.power === "rest" || st.power === "off") button = `<button class="btn" id="btn-power" data-power="wake">Wake</button>`;
+    // the button sits right after the console picker, the state after it
+    return `<span class="power">${button}<span class="power-state" id="power-state"><span class="power-dot ${dot}"></span>${label}</span>${error ? `<span class="muted">${this._escapeHtml(error)}</span>` : ""}</span>`;
+  }
+
+  // Rest while a game runs asks first: rest mode suspends it
+  _pwClick(action) {
+    const st = this._pwState();
+    if (!st || this._pw.busy) return;
+    this._pw.error = "";
+    if (action === "wake" && !st.canWake) {
+      this._pw.error = "No wake method yet: pair with the PS4, or add a wake entity, in the PS4 GoldHEN options.";
+    } else if (action === "rest" && st.playing) {
+      this._pw.confirm = true;
+    } else {
+      return this._pwRun(action);
+    }
+    this._render();
+  }
+
+  // The call returns once the wake / rest is sent (a wake that logs the user in takes ~25 s); the button then waits
+  // for the console's power state to follow, at most 90 s
+  async _pwRun(action) {
+    const st = this._pwState();
+    if (!st) return;
+    const pw = this._pw;
+    pw.confirm = false;
+    pw.busy = action;
+    pw.error = "";
+    this._render();
+    try {
+      await this._hass.callService("media_player", action === "wake" ? "turn_on" : "turn_off", { entity_id: st.eid });
+      if (pw !== this._pw) return;  // another console was picked meanwhile
+      pw.want = action === "wake" ? "on" : "rest";
+      if (this._pwState()?.power === pw.want) pw.busy = null;
+      else pw.timer = setTimeout(() => {
+        if (this._pw !== pw) return;
+        pw.busy = null;
+        this._render();
+      }, 90000);
+    } catch (e) {
+      if (pw !== this._pw) return;
+      pw.busy = null;
+      pw.error = `${action === "wake" ? "Couldn't wake it" : "Couldn't put it in rest mode"}: ${e.message || e}`;
+    }
+    this._render();
+  }
+
+  _renderPwConfirm() {
+    const st = this._pwState();
+    const name = this._escapeHtml(this._entryName(this._selectedEntry()));
+    const game = st?.game ? `<b>${this._escapeHtml(st.game)}</b>` : "A game";
+    return html`
+      <div class="editor-overlay ss-dialog sv-dlg" id="pw-confirm" data-dismiss>
+        <div class="editor-container">
+          <h3 style="margin-top:0">Put ${name} in rest mode?</h3>
+          <div>${game} is running. Rest mode suspends it.</div>
+          <div class="editor-actions">
+            <button id="pw-confirm-cancel">Cancel</button>
+            <button class="btn-save" id="pw-confirm-go">Rest mode</button>
+          </div>
+        </div>
+      </div>`;
   }
 
   // Switch console. The BinLoader target follows the console.
@@ -149,11 +292,14 @@ class PS4GoldHENPanel extends HTMLElement {
     this._path = "/";
     this._ftpEntries = [];
     this._ftpError = "";
+    this._ftpListed = false;
     this._ssStopPoll();
     this._ssReset();
     this._ptReset();
     this._svStopPoll();
     this._svReset();
+    this._gmReset();
+    this._pwReset();
   }
 
   async _loadEntries() {
@@ -232,8 +378,21 @@ class PS4GoldHENPanel extends HTMLElement {
   }
 
   // FTP
+  // Known to be in rest mode or off (the media player's live state): the FTP tab lists nothing and waits
+  _ftpAsleep() {
+    const power = this._pwState()?.power;
+    return power === "rest" || power === "off";
+  }
+
   async _loadDir(path = this._path) {
     if (!this._hass || !this._selectedEntryId) return;
+    if (this._ftpAsleep()) {
+      this._ftpEntries = [];
+      this._ftpListed = false;
+      this._ftpError = "";
+      this._render();
+      return;
+    }
     this._setLoading(true);
     try {
       const result = await this._hass.callWS({
@@ -243,6 +402,7 @@ class PS4GoldHENPanel extends HTMLElement {
       });
       this._path = result.path;
       this._ftpEntries = result.entries;
+      this._ftpListed = true;
       this._ftpError = "";
     } catch (e) {
       // shown in the tab, not a browser alert (a console in rest mode would pop one on every open)
@@ -617,6 +777,656 @@ class PS4GoldHENPanel extends HTMLElement {
     if (box) box.textContent = "";
   }
 
+  // ── Content: the console's games and apps as covers, and a page per game ─────────
+  // The grid and a game's page read HA only (ps4_goldhen/games/list + detail: the cached app.db, play time, HA's save
+  // copies). A game's page also lists that game's screenshots on the PS4 (one short FTP read, only while it's on).
+  // Its buttons are the other tabs' calls for one title: play_media / close_title, saves/backup, screenshots/sync.
+
+  _gmReset() {
+    this._gmStopPoll();
+    this._gm = {
+      list: null,        // ps4_goldhen/games/list → titles
+      error: "",
+      filter: "",
+      kind: "game",      // Games | Apps | All
+      sort: "recent",    // the console's last played order | most played | A–Z
+      open: null,        // the title ID whose page is shown
+      detail: null,      // ps4_goldhen/games/detail
+      detailError: "",
+      loadedAt: 0,       // when detail came: the running session's time counts on from there
+      shots: null,       // that game's screenshots on the PS4: {items, more, asleep}
+      shotsBusy: false,
+      shotsReq: null,
+      shotsError: "",
+      status: "",        // the page's result line (a launch, a backup, a sync)
+      busy: null,        // "launch" | "close" | "backup" | "sync": that call is running
+      confirm: null,     // the Launch / Close dialog: {kind: "launch" | "close", other, behind}
+      scrollTo: null,    // the grid's scroll position, back from a game's page
+      gridScroll: 0,
+    };
+  }
+
+  _gmStopPoll() {
+    if (this._gmTimer) clearInterval(this._gmTimer);
+    if (this._gmTick) clearInterval(this._gmTick);
+    this._gmTimer = null;
+    this._gmTick = null;
+  }
+
+  _gmIsOpen(entryId, tid) {
+    return entryId === this._selectedEntryId && this._gm.open === tid;
+  }
+
+  async _gmLoad() {
+    if (!this._hass || !this._selectedEntryId) return;
+    const entryId = this._selectedEntryId;
+    try {
+      const resp = await this._hass.callWS({ type: "ps4_goldhen/games/list", entry_id: entryId });
+      if (entryId !== this._selectedEntryId) return;
+      this._gm.list = resp.titles || [];
+      this._gm.error = "";
+    } catch (e) {
+      if (entryId !== this._selectedEntryId) return;
+      this._gm.error = e?.message || String(e);
+    }
+    if (this._tab !== "games") return;
+    this._render();
+    if (this._gm.open) await this._gmLoadDetail();
+  }
+
+  _gmOpen(tid) {
+    this._gmStopPoll();
+    Object.assign(this._gm, {
+      open: tid, detail: null, detailError: "", shots: null, shotsBusy: false, shotsReq: null, shotsError: "",
+      status: "", busy: null, confirm: null, gridScroll: this.scrollTop || 0,
+    });
+    this._ssView = null;
+    this._render();
+    this.scrollTop = 0;
+    this._gmLoadDetail();
+  }
+
+  // back to the covers, where the grid was
+  _gmClose() {
+    this._gmStopPoll();
+    Object.assign(this._gm, { open: null, detail: null, shots: null, status: "", busy: null, confirm: null,
+      scrollTo: this._gm.gridScroll });
+    this._ssView = null;
+  }
+
+  async _gmLoadDetail({ shots = true } = {}) {
+    const entryId = this._selectedEntryId;
+    const tid = this._gm.open;
+    if (!this._hass || !tid) return;
+    try {
+      const d = await this._hass.callWS({ type: "ps4_goldhen/games/detail", entry_id: entryId, title_id: tid });
+      if (!this._gmIsOpen(entryId, tid)) return;
+      this._gm.detail = d;
+      this._gm.detailError = "";
+      this._gm.loadedAt = Date.now();
+      // the Saves / Screenshots tabs' settings: their progress, the viewer, a sleeping console
+      if (d.saves_settings) this._svSettings = d.saves_settings;
+      if (d.screenshot_settings) this._ssSettings = d.screenshot_settings;
+    } catch (e) {
+      if (!this._gmIsOpen(entryId, tid)) return;
+      this._gm.detailError = e?.message || String(e);
+    }
+    if (this._tab !== "games") return;
+    this._render();
+    if (this._svSettings?.running || this._ssSettings?.syncing) this._gmStartPoll();
+    // the running session's time on the page goes up once a minute (no call, a render)
+    if (!this._gmTick) {
+      this._gmTick = setInterval(() => {
+        if (this._tab !== "games" || !this._gmIsOpen(entryId, tid)) return;
+        if (this._pwState()?.tid === tid && !this._gm.confirm && !this._ssView) this._render();
+      }, 60000);
+    }
+    if (shots) await this._gmLoadShots(true);
+  }
+
+  // that game's newest screenshots, 6 at a time; none while it sleeps (HA uses no FTP then)
+  async _gmLoadShots(reset) {
+    const entryId = this._selectedEntryId;
+    const tid = this._gm.open;
+    const s = this._ssSettings;
+    if (!s?.enabled || !tid || (!reset && this._gm.shotsBusy)) return;
+    if (s.power_state === "rest" || s.power_state === "off") {
+      this._gm.shots = { items: [], more: false, asleep: true };
+      this._render();
+      return;
+    }
+    const offset = reset ? 0 : this._gm.shots?.items.length || 0;
+    const req = {};  // a newer read (a page reload) takes over the busy flag
+    this._gm.shotsReq = req;
+    this._gm.shotsBusy = true;
+    this._render();
+    try {
+      const resp = await this._ssCall("list", { offset, count: 6, title_id: tid });
+      if (!this._gmIsOpen(entryId, tid)) return;
+      const items = reset ? resp.shots : (this._gm.shots?.items || []).concat(resp.shots);
+      this._gm.shots = { items, more: resp.more, asleep: resp.asleep };
+      this._gm.shotsError = "";
+    } catch (e) {
+      if (!this._gmIsOpen(entryId, tid)) return;
+      this._gm.shotsError = e?.message || String(e);
+    } finally {
+      if (this._gm.shotsReq === req) this._gm.shotsBusy = false;
+    }
+    if (this._tab === "games" && this._gmIsOpen(entryId, tid)) this._render();
+  }
+
+  // Once a second while a backup or sync runs (started here or in its tab), then the page is read again
+  _gmStartPoll() {
+    if (this._gmTimer) return;
+    const entryId = this._selectedEntryId;
+    const tid = this._gm.open;
+    let busy = false;
+    this._gmTimer = setInterval(async () => {
+      if (this._tab !== "games" || !this._gmIsOpen(entryId, tid)) {
+        clearInterval(this._gmTimer);
+        this._gmTimer = null;
+        return;
+      }
+      if (busy) return;  // a slow answer: no pile-up of calls
+      busy = true;
+      const saving = !!this._svSettings?.running;
+      const syncing = !!this._ssSettings?.syncing;
+      try {
+        if (saving) this._svSettings = await this._svCall("get");
+        if (syncing) this._ssSettings = await this._ssCall("get");
+      } catch (_) {
+        return;
+      } finally {
+        busy = false;
+      }
+      if (this._tab !== "games" || !this._gmIsOpen(entryId, tid)) return;
+      const savesDone = saving && !this._svSettings.running;
+      const shotsDone = syncing && !this._ssSettings.syncing;
+      if (savesDone) this._gm.status = this._svResultText(this._svSettings.last || {});
+      if (shotsDone) this._gm.status = this._ssResultText(this._ssSettings.last_sync || {});
+      if (this._svSettings?.running || this._ssSettings?.syncing) {
+        this._render();
+        return;
+      }
+      clearInterval(this._gmTimer);
+      this._gmTimer = null;
+      await this._gmLoadDetail({ shots: shotsDone });  // new copies: the Saves panel, the In HA badges
+    }, 1000);
+  }
+
+  // Launch asks first when it closes a game: a game starting closes the game in front or in the background (an app
+  // never closes anything). Close always asks.
+  _gmPlayClick() {
+    const st = this._pwState();
+    const d = this._gm.detail;
+    if (!st || !d || this._gm.busy) return;
+    if (st.tid === d.title_id) {
+      this._gm.confirm = { kind: "close" };
+    } else {
+      const front = st.playing && st.type === "game" ? st.game || st.tid : "";
+      const behind = d.suspended && d.suspended.title_id !== d.title_id ? d.suspended.name || d.suspended.title_id : "";
+      if (d.kind !== "game" || (!front && !behind)) return this._gmRun("launch");
+      this._gm.confirm = { kind: "launch", other: front || behind, behind: !front };
+    }
+    this._render();
+  }
+
+  async _gmRun(kind) {
+    const d = this._gm.detail;
+    const st = this._pwState();
+    const entry = this._selectedEntry();
+    if (!d || this._gm.busy) return;
+    const entryId = this._selectedEntryId;
+    const tid = d.title_id;
+    this._gm.confirm = null;
+    this._gm.busy = kind;
+    this._gm.status = "";
+    this._render();
+    try {
+      if (kind === "launch") {
+        await this._hass.callService("media_player", "play_media",
+          { entity_id: st.eid, media_content_id: tid, media_content_type: d.kind });
+        this._gm.status = `${d.name} is starting.`;
+      } else if (kind === "close") {
+        await this._hass.callService("ps4_goldhen", "close_title", { title_id: tid, ps4_host: entry.ps4_host });
+        this._gm.status = `Closed ${d.name}.`;
+      } else if (kind === "backup") {
+        await this._svCall("backup", { title_id: tid });
+        this._svSettings = { ...this._svSettings, running: true, progress: { done: 0, total: 0 } };
+        this._gmStartPoll();
+      } else if (kind === "sync") {
+        const result = await this._ssCall("sync", { kind: "game", title_id: tid });
+        this._ssSettings = await this._ssCall("get");
+        if (!result.total) this._gm.status = "Nothing new to copy: HA has all of this game's screenshots.";
+        if (this._ssSettings.syncing) this._gmStartPoll();
+      }
+    } catch (e) {
+      const what = { launch: "Couldn't start it", close: "Couldn't close it", backup: "Couldn't back up", sync: "Couldn't sync" };
+      if (this._gmIsOpen(entryId, tid)) this._gm.status = `${what[kind]}: ${e?.message || e}`;
+    } finally {
+      if (this._gmIsOpen(entryId, tid)) this._gm.busy = null;
+    }
+    if (this._tab === "games" && this._gmIsOpen(entryId, tid)) this._render();
+  }
+
+  // the grid's titles: Games / Apps / All, the filter, then the sort (recent = the console's order, as listed)
+  _gmTitles() {
+    const g = this._gm;
+    const q = g.filter.trim().toLowerCase();
+    const items = (g.list || []).filter((t) => (g.kind === "all" || t.kind === g.kind)
+      && (!q || t.name.toLowerCase().includes(q) || t.title_id.toLowerCase().includes(q)));
+    if (g.sort === "played") items.sort((a, b) => (b.play?.seconds || 0) - (a.play?.seconds || 0));
+    if (g.sort === "name") items.sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" }));
+    return items;
+  }
+
+  // "today", "yesterday", "3 days ago", else the date
+  _gmAgo(iso) {
+    const d = new Date(iso);
+    if (!iso || isNaN(d)) return "";
+    const day = (x) => new Date(x.getFullYear(), x.getMonth(), x.getDate());
+    const days = Math.round((day(new Date()) - day(d)) / 86400000);
+    if (days <= 0) return "today";
+    if (days === 1) return "yesterday";
+    if (days < 7) return `${days} days ago`;
+    const opts = { month: "short", day: "numeric" };
+    if (d.getFullYear() !== new Date().getFullYear()) opts.year = "numeric";
+    return d.toLocaleDateString(undefined, opts);
+  }
+
+  // only HA's own paths go into a style or an img (the media player proxy, a signed path)
+  _gmUrl(url) {
+    return typeof url === "string" && /^\/api\/[A-Za-z0-9_\-./?=&%:]*$/.test(url) ? url : "";
+  }
+
+  _gmPill(state, text) {
+    return `<span class="gm-pill gm-st-${state} ${state === "playing" ? "gm-pulse" : ""}"><span class="gm-dot"></span>${text}</span>`;
+  }
+
+  // the console's state as the hero shows it: [class, label]
+  _gmPower(st) {
+    if (!st) return ["off", "OFFLINE"];
+    if (st.playing) return ["playing", "PLAYING"];
+    return { on: ["on", "ON"], rest: ["rest", "REST"], off: ["off", "OFF"] }[st.power] || ["off", "UNKNOWN"];
+  }
+
+  _gmShapes() {
+    const shapes = [["mdi:triangle-outline", "#4fd1a5", "9%", "8%", 110, 0], ["mdi:circle-outline", "#ff6e6b", "19%", "52%", 88, 2],
+      ["mdi:close", "#6fa8ff", "3%", "62%", 100, 4], ["mdi:square-outline", "#f48fb1", "22%", "14%", 70, 6]];
+    return shapes.map(([icon, color, right, top, size, delay]) =>
+      `<ha-icon class="gm-shape" icon="${icon}" style="right:${right};top:${top};--mdc-icon-size:${size}px;color:${color};animation-duration:${9 + delay}s;animation-delay:-${delay}s"></ha-icon>`).join("");
+  }
+
+  _renderGames() {
+    const g = this._gm;
+    if (g.open) return this._renderGame();
+    if (g.error) {
+      return `<div class="card"><div class="ss-warn">Couldn't load the console's content: ${this._escapeHtml(g.error)}</div>
+        <div class="row"><button class="btn" id="gm-retry">Retry</button></div></div>`;
+    }
+    if (!g.list) return `<div class="loading">Loading content...</div>`;
+    const games = g.list.filter((t) => t.kind === "game").length;
+    const apps = g.list.length - games;
+    const seg = `<div class="seg" id="gm-kind">${[["game", `Games ${games}`], ["app", `Apps ${apps}`], ["all", "All"]]
+      .map(([v, label]) => `<button data-value="${v}" class="${g.kind === v ? "active" : ""}">${label}</button>`).join("")}</div>`;
+    const sort = `<select id="gm-sort" aria-label="Sort">${[["recent", "Last played"], ["played", "Most played"], ["name", "A–Z"]]
+      .map(([v, label]) => `<option value="${v}" ${g.sort === v ? "selected" : ""}>${label}</option>`).join("")}</select>`;
+    const body = g.list.length
+      ? `<div class="gm-grid" id="gm-grid">${this._gmCards()}</div>`
+      : `<div class="muted">Nothing yet. HA reads the console's games and apps once the PS4 is on with GoldHEN's FTP enabled.</div>`;
+    return html`
+      ${this._renderGmNow(games, apps)}
+      <div class="gm-glass">
+        <div class="gm-toolbar">
+          <input id="gm-filter" type="search" placeholder="Search games and apps..." value="${this._escapeHtml(g.filter)}">
+          ${seg}${sort}
+        </div>
+        ${body}
+      </div>`;
+  }
+
+  // the top of the grid: what's on the console now (the cover, blurred behind it, while a game or app runs)
+  _renderGmNow(games, apps) {
+    const st = this._pwState();
+    const name = this._escapeHtml(this._entryName(this._selectedEntry()));
+    const [state, label] = this._gmPower(st);
+    const item = st?.tid ? (this._gm.list || []).find((t) => t.title_id === st.tid) : null;
+    if (st?.playing) {
+      const cover = this._gmUrl(item?.cover) || this._gmUrl(st.picture);
+      const title = this._escapeHtml(item?.name || st.game || st.tid);
+      const played = item?.play ? `${this._ptDuration(item.play.seconds)} played in all` : "";
+      const art = cover ? `<img class="gm-hero-art" src="${this._escapeHtml(cover)}" alt="">`
+        : `<div class="gm-hero-art"><ha-icon icon="mdi:sony-playstation"></ha-icon></div>`;
+      return html`
+        <div class="gm-hero ${item ? "gm-tap" : ""}" id="gm-now" ${item ? `data-tid="${this._escapeHtml(item.title_id)}"` : ""}>
+          ${cover ? `<div class="gm-hero-bg" style="background-image:url('${this._escapeHtml(cover)}')"></div>` : `<div class="gm-hero-glow"></div>`}
+          <div class="gm-hero-body">${art}
+            <div class="gm-hero-text">
+              <div class="gm-eyebrow">Now playing · ${name}</div>
+              <div class="gm-title ${title.length > 28 ? "gm-long" : ""}">${title}</div>
+              <div class="gm-status">${this._gmPill(state, label)}</div>
+              ${played || item ? `<div class="gm-hero-sub">${[played, item ? "Tap for its page" : ""].filter(Boolean).join(" · ")}</div>` : ""}
+            </div>
+          </div>
+        </div>`;
+    }
+    const glow = { on: "rgba(0,112,209,0.34)", rest: "rgba(255,152,0,0.14)" }[st?.power] || "rgba(0,112,209,0.10)";
+    const sub = { on: "On the home screen", rest: "In rest mode", off: "Off" }[st?.power] || "Not reporting";
+    return html`
+      <div class="gm-hero">
+        <div class="gm-hero-glow" style="--gm-glow:${glow}"></div>${this._gmShapes()}
+        <div class="gm-hero-body">
+          <div class="gm-hero-art" style="width:clamp(72px, 10vw, 110px)"><ha-icon icon="mdi:sony-playstation" style="--mdc-icon-size:clamp(40px, 6vw, 64px)"></ha-icon></div>
+          <div class="gm-hero-text">
+            <div class="gm-eyebrow">${name}</div>
+            <div class="gm-status" style="margin-top:0">${this._gmPill(state, label)}<span class="gm-hero-sub" style="margin:0">${sub}</span></div>
+            <div class="gm-chips"><span class="gm-chip">${games} games</span><span class="gm-chip">${apps} apps</span></div>
+          </div>
+        </div>
+      </div>`;
+  }
+
+  _gmCards() {
+    const tid = this._pwState()?.tid;
+    const items = this._gmTitles();
+    if (!items.length) return `<div class="muted">Nothing matches.</div>`;
+    return items.map((t) => {
+      const name = this._escapeHtml(t.name);
+      const cover = this._gmUrl(t.cover);
+      const live = tid === t.title_id;
+      const sub = t.play ? `${this._ptDuration(t.play.seconds)} · ${this._gmAgo(t.play.last)}` : "No play time yet";
+      return `
+        <div class="payload-card gm-card ${live ? "gm-live" : ""}">
+          <button class="payload-btn" data-tid="${this._escapeHtml(t.title_id)}" title="${name}">
+            <div class="gm-art"><ha-icon icon="mdi:sony-playstation"></ha-icon>${cover ? `<img class="gm-img" src="${this._escapeHtml(cover)}" alt="" loading="lazy">` : ""}</div>
+            <div class="payload-name"><span class="gm-name">${name}</span><span class="muted gm-sub">${this._escapeHtml(sub)}</span></div>
+          </button>
+          ${live ? `<div class="ss-badges"><span class="pill">PLAYING</span></div>` : ""}
+        </div>`;
+    }).join("");
+  }
+
+  // ── Content: a game's page ──
+
+  _renderGame() {
+    const g = this._gm;
+    const d = g.detail;
+    const item = (g.list || []).find((t) => t.title_id === g.open);
+    const back = `<button class="btn gm-back" id="gm-back">← All content</button>`;
+    if (!d) {
+      const wait = g.detailError
+        ? `<div class="card"><div class="ss-warn">Couldn't load this game: ${this._escapeHtml(g.detailError)}</div>
+            <div class="row"><button class="btn" id="gm-retry">Retry</button></div></div>`
+        : `<div class="loading">Loading ${this._escapeHtml(item?.name || g.open)}...</div>`;
+      return `${back}${wait}`;
+    }
+    return html`
+      ${back}
+      ${this._renderGmHero(d)}
+      ${this._renderGmControls(d)}
+      ${g.status ? `<div class="card muted" id="gm-status">${this._escapeHtml(g.status)}</div>` : ""}
+      <div class="gm-panels">
+        ${this._renderGmPlay(d)}
+        ${this._renderGmSaves(d)}
+        ${this._renderGmShots(d)}
+      </div>
+      ${this._ssView ? this._renderSsView() : ""}`;
+  }
+
+  // the running session's seconds (counted on since the page was read), else null
+  _gmSession(d) {
+    const s = d.play?.recent?.[0];
+    if (!s?.playing || this._pwState()?.tid !== d.title_id) return null;
+    return s.seconds + Math.max(0, (Date.now() - this._gm.loadedAt) / 1000);
+  }
+
+  _renderGmHero(d) {
+    const st = this._pwState();
+    const cover = this._gmUrl(d.cover);
+    const name = this._escapeHtml(d.name);
+    const consoleName = this._escapeHtml(this._entryName(this._selectedEntry()));
+    const running = st?.tid === d.title_id;
+    const session = this._gmSession(d);
+    const status = running
+      ? `${this._gmPill("playing", "PLAYING NOW")}${session !== null ? `<span class="gm-timer"><ha-icon icon="mdi:timer-outline"></ha-icon>${this._ptDuration(session)}</span>` : ""}`
+      : d.play?.last ? this._gmPill("off", `LAST PLAYED ${this._gmAgo(d.play.last).toUpperCase()}`)
+      : this._gmPill("off", "NO PLAY TIME YET");
+    const i = d.info || {};
+    const installed = i.installed ? new Date(i.installed.replace(" ", "T")) : null;
+    const chip = (text, mono = false) => `<span class="gm-chip ${mono ? "gm-mono" : ""}">${this._escapeHtml(text)}</span>`;
+    const chips = [
+      chip(d.title_id, true),
+      i.version ? chip(`Version ${i.version}`) : "",
+      i.region ? chip(i.region) : "",
+      i.size ? chip(this._ssMB(i.size)) : "",
+      installed && !isNaN(installed) ? chip(`Installed ${installed.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })}`) : "",
+      i.folder ? chip(`Folder: ${i.folder}`) : "",
+    ].join("");
+    const art = cover ? `<img class="gm-hero-art" src="${this._escapeHtml(cover)}" alt="">`
+      : `<div class="gm-hero-art"><ha-icon icon="mdi:sony-playstation"></ha-icon></div>`;
+    return html`
+      <div class="gm-hero">
+        ${cover ? `<div class="gm-hero-bg" style="background-image:url('${this._escapeHtml(cover)}')"></div>` : `<div class="gm-hero-glow"></div>${this._gmShapes()}`}
+        <div class="gm-hero-body">${art}
+          <div class="gm-hero-text">
+            <div class="gm-eyebrow">${d.kind === "app" ? "App" : "Game"} · ${consoleName}</div>
+            <div class="gm-title ${d.name.length > 28 ? "gm-long" : ""}">${name}</div>
+            <div class="gm-status">${status}</div>
+            <div class="gm-chips">${chips}</div>
+          </div>
+        </div>
+      </div>`;
+  }
+
+  // Launch / Close · Back up saves · Sync screenshots: greyed (with why) when they can't run now
+  _renderGmControls(d) {
+    const st = this._pwState();
+    const g = this._gm;
+    const asleep = st?.power === "rest" || st?.power === "off";
+    const running = st?.tid === d.title_id;
+    const open = running || d.suspended?.title_id === d.title_id;
+    const sv = this._svSettings;
+    const ss = this._ssSettings;
+    const ctl = (id, icon, color, label, why, enabled) => `
+      <button class="gm-ctl" id="${id}" style="--gm-ic:${color}" ${enabled ? "" : "disabled"}>
+        <ha-icon icon="${icon}"></ha-icon>${label}${why ? `<span class="gm-why">${why}</span>` : ""}
+      </button>`;
+    const play = running
+      ? ctl("gm-play", "mdi:close-circle-outline", "#ff8a80", g.busy === "close" ? "Closing..." : "Close", "", !g.busy)
+      : ctl("gm-play", "mdi:play-circle-outline", "#81c784", g.busy === "launch" ? "Starting..." : d.kind === "app" ? "Open" : "Launch",
+        !st ? "The PS4 isn't reporting" : st.power === "off" ? "Fully off: load GoldHEN first" : "", !g.busy && !!st && st.power !== "off");
+    const savesOff = !sv || sv.mode === "off";
+    const backup = ctl("gm-backup", "mdi:content-save-move-outline", "#4f9be8",
+      sv?.running ? `Backing up ${sv.progress?.done || 0} / ${sv.progress?.total || 0}` : g.busy === "backup" ? "Starting..." : "Back up saves",
+      savesOff ? "Save backup is off" : asleep ? "Turn the PS4 on first" : open ? "Close the game first" : "",
+      !g.busy && !savesOff && !asleep && !open && !sv.running);
+    const shotsOff = !ss?.enabled;
+    const sync = ctl("gm-sync", "mdi:image-sync-outline", "#4f9be8",
+      ss?.syncing ? `Syncing ${ss.progress?.done || 0} / ${ss.progress?.total || 0}` : g.busy === "sync" ? "Starting..." : "Sync screenshots",
+      shotsOff ? "Screenshots are off" : asleep ? "Turn the PS4 on first" : "",
+      !g.busy && !shotsOff && !asleep && !ss.syncing);
+    return `<div class="gm-ctls">${play}${backup}${sync}</div>`;
+  }
+
+  _renderGmPlay(d) {
+    const p = d.play;
+    const head = `<div class="gm-head">Play time<span>in-game only</span></div>`;
+    if (!p || (!p.seconds && !p.sessions)) {
+      return `<div class="gm-glass">${head}<div class="muted">No play time yet. HA counts it while the game is on screen.</div></div>`;
+    }
+    const session = this._gmSession(d);
+    const extra = session !== null ? Math.max(0, session - (p.recent[0]?.seconds || 0)) : 0;
+    const tile = (label, value, sub = "") => `<div class="gm-tile"><div class="gm-tile-label">${label}</div>
+      <div class="gm-tile-num">${value}</div>${sub ? `<div class="gm-tile-sub">${sub}</div>` : ""}</div>`;
+    const since = p.first ? `since ${this._escapeHtml(this._gmAgo(p.first))}` : "";
+    const avg = (secs, n) => (secs ? `${this._ptDuration(secs / n)} / day` : "");
+    const max = Math.max(...p.days.map((x) => x.seconds), 1);
+    const bars = p.days.map((x) => {
+      const label = `${new Date(`${x.day}T12:00:00`).toLocaleDateString(undefined, { month: "short", day: "numeric" })}: ${this._ptDuration(x.seconds)}`;
+      return `<div class="gm-bar ${x.seconds ? "" : "gm-zero"}" style="height:${x.seconds ? Math.max(6, Math.round((x.seconds / max) * 100)) : 3}%" title="${this._escapeHtml(label)}"></div>`;
+    }).join("");
+    const rows = p.recent.slice(0, 5).map((s) => `<div class="gm-row"><span>${this._escapeHtml(this._ptWhen(s.start))}</span>
+      <span>${s.playing ? `<span class="pill pt-playing">Playing</span> ` : ""}${this._ptDuration(s.playing ? s.seconds + extra : s.seconds)}</span></div>`).join("");
+    return html`
+      <div class="gm-glass">
+        ${head}
+        <div class="gm-tiles">
+          ${tile("TOTAL", this._ptDuration(p.seconds + extra), since)}
+          ${tile("SESSIONS", String(p.sessions))}
+          ${tile("7 DAYS", this._ptDuration(p.week + extra), avg(p.week + extra, 7))}
+          ${tile("30 DAYS", this._ptDuration(p.month + extra), avg(p.month + extra, 30))}
+        </div>
+        <div class="gm-bars" title="The last 30 days">${bars}</div>
+        <div class="gm-bar-axis"><span>30 days ago</span><span>today</span></div>
+        <div class="gm-rows">${rows}</div>
+      </div>`;
+  }
+
+  _renderGmSaves(d) {
+    const sv = this._svSettings;
+    const head = (right) => `<div class="gm-head">Saves<span>${right}</span></div>`;
+    if (!sv || sv.mode === "off" || !d.saves) {
+      return `<div class="gm-glass">${head("off")}<div class="muted">Save backup is off for this PS4: turn it on in the Saves tab.</div></div>`;
+    }
+    const slots = d.saves.reduce((n, u) => n + u.slots.length, 0);
+    const newest = d.saves.map((u) => u.last_saved).filter(Boolean).sort().pop();
+    const bytes = d.saves.reduce((n, u) => n + (u.bytes || 0), 0);
+    const pill = sv.running ? this._gmPill("on", `BACKING UP ${sv.progress?.done || 0} / ${sv.progress?.total || 0}`)
+      : slots ? this._gmPill("playing", "IN HA") : this._gmPill("off", "NOT BACKED UP");
+    if (!slots) {
+      return `<div class="gm-glass">${head("open games are skipped")}${pill}
+        <div class="muted gm-note">No copies in HA yet. Back up saves copies this game's saves from the PS4 (with the game closed).</div></div>`;
+    }
+    const multi = d.saves.length > 1;
+    const users = d.saves.map((u) => `
+      ${multi ? `<div class="gm-user">${this._escapeHtml(u.user)}</div>` : ""}
+      ${u.slots.map((s) => `<div class="gm-row"><span>${this._escapeHtml(s.name || s.slot)}${s.on_ps4 === false ? ` <span class="muted">(not on the PS4)</span>` : ""}</span>
+        <span class="muted">${this._escapeHtml(this._svWhen(s.saved))}${s.versions ? ` · +${s.versions} older` : ""}</span></div>`).join("")}`).join("");
+    return html`
+      <div class="gm-glass">
+        ${head("open games are skipped")}
+        ${pill}
+        <div class="gm-big" style="margin-top:12px">${slots} save${slots === 1 ? "" : "s"}</div>
+        <div class="muted">${newest ? `newest copy ${this._escapeHtml(this._svWhen(newest))} · ` : ""}${this._ssMB(bytes)} in HA</div>
+        <div class="gm-rows">${users}</div>
+      </div>`;
+  }
+
+  _renderGmShots(d) {
+    const ss = this._ssSettings;
+    const g = this._gm;
+    const head = (right) => `<div class="gm-head">Screenshots<span>${right}</span></div>`;
+    if (!ss?.enabled) {
+      return `<div class="gm-glass gm-span">${head("off")}<div class="muted">Screenshots are off for this PS4: turn them on in the Screenshots tab.</div></div>`;
+    }
+    const shots = g.shots;
+    let body;
+    if (g.shotsError) body = `<div class="ss-warn">${this._escapeHtml(g.shotsError)}</div>`;
+    else if (shots?.asleep) body = `<div class="muted">The PS4 is ${ss.power_state === "rest" ? "in rest mode" : "off"}: turn it on to see this game's screenshots.</div>`;
+    else if (!shots) body = `<div class="muted">Reading the PS4...</div>`;
+    else if (!shots.items.length) body = `<div class="muted">No screenshots of this game on the PS4.</div>`;
+    else {
+      body = `<div class="gm-shots" id="gm-shots">${shots.items.map((s) => `
+        <button class="gm-shot" data-rel="${this._escapeHtml(s.rel)}" title="${this._escapeHtml(s.name)}">
+          ${s.thumb ? `<img src="${this._escapeHtml(s.thumb)}" alt="">` : ""}
+          <div class="ss-badges">${s.trophy ? `<span class="pill gm-trophy">Trophy</span>` : ""}${s.in_ha ? `<span class="pill in-ha">In HA</span>` : ""}</div>
+          <div class="gm-shot-cap">${this._escapeHtml(this._ssTaken(s.taken))}</div>
+        </button>`).join("")}</div>
+        ${shots.more ? `<div class="row"><button class="btn" id="gm-shots-more" ${g.shotsBusy ? "disabled" : ""}>Show more</button></div>` : ""}`;
+    }
+    const right = g.shotsBusy && shots ? "reading..." : "newest first";
+    return `<div class="gm-glass gm-span">${head(right)}${body}</div>`;
+  }
+
+  _renderGmConfirm() {
+    const c = this._gm.confirm;
+    const d = this._gm.detail;
+    if (!c || !d) return "";
+    const name = `<b>${this._escapeHtml(d.name)}</b>`;
+    const close = c.kind === "close";
+    const text = close ? `${name} closes. Anything not saved is lost.`
+      : `<b>${this._escapeHtml(c.other)}</b> is open${c.behind ? " in the background" : ""}. Starting ${name} closes it: anything not saved is lost.`;
+    return html`
+      <div class="editor-overlay ss-dialog sv-dlg" id="gm-confirm" data-dismiss>
+        <div class="editor-container">
+          <h3 style="margin-top:0">${close ? `Close ${this._escapeHtml(d.name)}?` : `Start ${this._escapeHtml(d.name)}?`}</h3>
+          <div>${text}</div>
+          <div class="editor-actions">
+            <button id="gm-confirm-cancel">Cancel</button>
+            <button class="${close ? "btn-danger" : "btn-save"}" id="gm-confirm-go">${close ? "Close" : "Start"}</button>
+          </div>
+        </div>
+      </div>`;
+  }
+
+  // a cover that doesn't load leaves the PlayStation mark under it
+  _gmBindImgs() {
+    this.shadowRoot.querySelectorAll("img.gm-img").forEach((img) => {
+      img.onerror = () => img.classList.add("gm-noimg");
+      if (img.complete && img.naturalWidth === 0 && img.src) img.classList.add("gm-noimg");
+    });
+  }
+
+  _bindGamesEvents() {
+    const $ = (sel) => this.shadowRoot.querySelector(sel);
+    const on = (sel, fn) => {
+      const el = $(sel);
+      if (el) el.onclick = fn;
+    };
+    const g = this._gm;
+    this._gmBindImgs();
+    on("#gm-retry", () => (g.open ? this._gmLoadDetail() : this._gmLoad()));
+    const filter = $("#gm-filter");
+    if (filter) {
+      // the grid only: a full render would take the focus off the box
+      filter.oninput = () => {
+        g.filter = filter.value || "";
+        const grid = $("#gm-grid");
+        if (grid) grid.innerHTML = this._gmCards();
+        this._gmBindImgs();
+      };
+    }
+    on("#gm-kind", (ev) => {
+      const b = ev.target.closest("button[data-value]");
+      if (!b || b.dataset.value === g.kind) return;
+      g.kind = b.dataset.value;
+      this._render();
+    });
+    const sort = $("#gm-sort");
+    if (sort) sort.onchange = () => {
+      g.sort = sort.value;
+      this._render();
+    };
+    on("#gm-grid", (ev) => {
+      const b = ev.target.closest("button[data-tid]");
+      if (b) this._gmOpen(b.dataset.tid);
+    });
+    on("#gm-now", (ev) => {
+      const tid = ev.currentTarget.dataset.tid;
+      if (tid) this._gmOpen(tid);
+    });
+    on("#gm-back", () => {
+      this._gmClose();
+      this._render();
+    });
+    on("#gm-play", () => this._gmPlayClick());
+    on("#gm-backup", () => this._gmRun("backup"));
+    on("#gm-sync", () => this._gmRun("sync"));
+    on("#gm-shots-more", () => this._gmLoadShots(false));
+    on("#gm-shots", (ev) => {
+      const b = ev.target.closest("button[data-rel]");
+      const shot = b && g.shots?.items.find((s) => s.rel === b.dataset.rel);
+      if (shot) this._ssOpenView(shot);
+    });
+    on("#gm-confirm-cancel", () => this._closeOverlay());
+    on("#gm-confirm-go", () => this._gmRun(g.confirm?.kind));
+    this._bindSsViewEvents();
+    if (g.scrollTo !== null && !g.open) {
+      this.scrollTop = g.scrollTo;
+      g.scrollTo = null;
+    }
+  }
+
   // ── Play time: read from HA's own store, nothing is asked of the PS4 ─────────────
 
   _ptReset() {
@@ -897,12 +1707,25 @@ class PS4GoldHENPanel extends HTMLElement {
     let kept = last.retried ? ` ${last.retried} changed while copying: back up again to copy them.` : "";
     if (last.open?.length) kept += ` Skipped ${last.open.join(", ")}: open on the PS4. Close it, then back up again.`;
     if (last.state === "failed") return `Stopped after ${last.copied || 0} copied: ${last.error}`;
+    if (last.state === "stopped") return `Stopped: ${last.copied || 0} copied, ${last.left || 0} left. Back up again to copy the rest.${kept}`;
     if (last.state === "limit_reached") {
       return `Copied ${last.copied || 0}; ${last.skipped} didn't fit under the storage limit.${kept}`;
     }
     const n = last.checked || 0;
     if (!last.copied) return `Checked ${n} save${n === 1 ? "" : "s"}: nothing new to copy.${kept}`;
     return `Done: ${last.copied} of ${n} saves were new or changed.${kept}`;
+  }
+
+  // Stop: the pass ends after the save being copied; the poll shows "Stopping..." until it has
+  async _svStop() {
+    this._svStatusPane = "ps4";
+    try {
+      await this._svCall("stop");
+      this._svSettings = { ...this._svSettings, stopping: true };
+    } catch (e) {
+      this._svStatus = `Couldn't stop: ${e.message || e}`;
+    }
+    this._render();
   }
 
   async _svKeep(uid, titleId, slot, stamp, kept) {
@@ -1222,7 +2045,7 @@ class PS4GoldHENPanel extends HTMLElement {
           <li>Nothing is overwritten or lost: when a save changed, HA's previous copy becomes an older version (In HA).</li>
           <li>A game that's open on the PS4 (on screen or suspended) is skipped: close it first.</li>
           <li>Storage: ${this._ssMB(s.usage.bytes)} of ${Number(s.limit_gb).toFixed(1)} GB used. Over the limit the oldest older versions go first (Keep protects one); the newest copies are never deleted.</li>
-          <li>It runs in the background; progress shows on this page.</li>
+          <li>It runs in the background; progress shows on this page. Stop ends it after the save being copied: what's copied stays.</li>
         </ul>`;
     } else if (c.kind === "send") {
       const target = this._entries.length > 1
@@ -1371,18 +2194,21 @@ class PS4GoldHENPanel extends HTMLElement {
   }
 
   // A pass in progress, in the panes' sticky toolbars so it stays in view while the list scrolls (the HA pane's only
-  // shows on phones, one pane at a time). Its count is saves to copy, known once the PS4 has been read.
+  // shows on phones, one pane at a time). Its count is saves to copy, known once the PS4 has been read. Stop ends the
+  // pass after the save being copied (no half file), so it can take a while on a big save.
   _svProgress(s) {
     if (!s?.running) return "";
     const done = s.progress?.done || 0;
     const total = s.progress?.total || 0;
     const pct = total ? Math.min(100, Math.round((done / total) * 100)) : 0;
-    const label = total ? `Backing up ${done} of ${total} save${total === 1 ? "" : "s"}` : "Reading the PS4's saves...";
+    const label = s.stopping ? "Stopping after the save being copied..."
+      : total ? `Backing up ${done} of ${total} save${total === 1 ? "" : "s"}` : "Reading the PS4's saves...";
+    // the role sits on the track: a progressbar can't hold the Stop button
     return `
-      <div class="sv-progress" role="progressbar" aria-label="Save backup" aria-valuemin="0"
-        aria-valuemax="${total}" aria-valuenow="${done}" ${total ? "" : `aria-valuetext="${label}"`}>
-        <div class="sv-progress-text"><span>${label}</span>${total ? `<span class="muted">${pct}%</span>` : ""}</div>
-        <div class="sv-progress-track"><div class="sv-progress-fill${total ? "" : " sv-progress-wait"}" style="width:${total ? pct : 100}%"></div></div>
+      <div class="sv-progress">
+        <div class="sv-progress-text"><span>${label}</span><span class="sv-progress-end">${total ? `<span class="muted">${pct}%</span>` : ""}<button class="btn" data-act="stop-backup" ${s.stopping ? "disabled" : ""}>Stop</button></span></div>
+        <div class="sv-progress-track" role="progressbar" aria-label="Save backup" aria-valuemin="0"
+          aria-valuemax="${total}" aria-valuenow="${done}" ${total ? "" : `aria-valuetext="${label}"`}><div class="sv-progress-fill${total ? "" : " sv-progress-wait"}" style="width:${total ? pct : 100}%"></div></div>
       </div>`;
   }
 
@@ -1661,6 +2487,7 @@ class PS4GoldHENPanel extends HTMLElement {
       if (act === "reload-ha") this._svReloadHa();
       if (act === "keep") this._svKeep(uid, tid, slot, stamp, el.checked);
       if (act === "clear-sent") this._svClearSent();
+      if (act === "stop-backup") this._svStop();
     };
   }
 
@@ -1675,9 +2502,15 @@ class PS4GoldHENPanel extends HTMLElement {
         .topbar { display:flex; gap:12px; align-items:center; flex-wrap:wrap; padding-bottom:12px; border-bottom:1px solid var(--divider-color); margin-bottom:12px; }
         .logo { height:44px; width:auto; display:block; }
         .picker { display:flex; gap:8px; align-items:center; background:var(--secondary-background-color); padding:8px 10px; border-radius:6px; flex-wrap:wrap; }
+        .power { display:inline-flex; gap:8px; align-items:center; flex-wrap:wrap; }
+        .power-state { display:inline-flex; gap:6px; align-items:center; font-size:13px; }
+        .power-dot { width:10px; height:10px; border-radius:50%; box-sizing:border-box; border:2px solid var(--secondary-text-color); }
+        .power-dot.on { background:var(--success-color, #43a047); border-color:var(--success-color, #43a047); }
+        .power-dot.rest { background:var(--warning-color, #ffa600); border-color:var(--warning-color, #ffa600); }
+        .power-dot.off { background:var(--secondary-text-color); }
         select, input[type="text"], input[type="number"], input[type="search"] { padding:6px 8px; border-radius:6px; border:1px solid var(--divider-color); background:var(--card-background-color); color:var(--primary-text-color); }
         .tabs { display:flex; gap:8px; margin:12px 0 16px 0; flex-wrap:wrap; }
-        .tabbtn { cursor:pointer; padding:8px 12px; border-radius:999px; border:1px solid var(--divider-color); background:var(--card-background-color); color:var(--primary-text-color); }
+        .tabbtn { cursor:pointer; padding:6px 12px; border-radius:6px; border:1px solid var(--divider-color); background:var(--card-background-color); color:var(--primary-text-color); }
         .tabbtn.active { border-color:var(--primary-color); box-shadow:0 0 0 2px rgba(3,169,244,0.25); }
         .loading { font-style:italic; color:var(--secondary-text-color); margin:8px 0; }
         .card { background:var(--card-background-color); border:1px solid var(--divider-color); border-radius:10px; padding:12px; margin-bottom:12px; }
@@ -1701,7 +2534,7 @@ class PS4GoldHENPanel extends HTMLElement {
         .editor-container { background:var(--primary-background-color); width:90%; height:90%; display:flex; flex-direction:column; padding:16px; border-radius:8px; box-shadow:0 4px 20px rgba(0,0,0,0.5); }
         #editor-textarea { flex:1; font-family:Consolas,Monaco,monospace; font-size:14px; padding:12px; border:1px solid var(--divider-color); background:var(--secondary-background-color); color:var(--primary-text-color); resize:none; outline:none; }
         .editor-actions { margin-top:16px; display:flex; justify-content:flex-end; gap:12px; }
-        .editor-actions button { padding:8px 20px; border-radius:6px; border:1px solid var(--divider-color); background:var(--card-background-color); color:var(--primary-text-color); cursor:pointer; }
+        .editor-actions button { padding:6px 16px; border-radius:6px; border:1px solid var(--divider-color); background:var(--card-background-color); color:var(--primary-text-color); cursor:pointer; }
         .btn-save { background:var(--primary-color)!important; color:#fff!important; border:none!important; }
         .btn-save { font-weight:600; }
         .btn-danger { background:var(--error-color, #c62828)!important; color:#fff!important; border:none!important; font-weight:600; }
@@ -1737,7 +2570,7 @@ class PS4GoldHENPanel extends HTMLElement {
         /* Screenshots: same cards as the payload grid, 16:9 like the console's thumbnails */
         .ss-settings { display:grid; grid-template-columns: max-content minmax(0, 1fr); gap:10px 16px; align-items:center; }
         .ss-settings > * { min-width:0; overflow-wrap:anywhere; }
-        .seg { display:inline-flex; justify-self:start; border:1px solid var(--divider-color); border-radius:999px; overflow:hidden; }
+        .seg { display:inline-flex; justify-self:start; border:1px solid var(--divider-color); border-radius:6px; overflow:hidden; }
         .seg button { cursor:pointer; padding:6px 12px; border:none; background:var(--card-background-color); color:var(--primary-text-color); }
         .seg button + button { border-left:1px solid var(--divider-color); }
         .seg button.active { background:var(--primary-color); color:#fff; }
@@ -1770,6 +2603,119 @@ class PS4GoldHENPanel extends HTMLElement {
         .pt-tid { font-family:monospace; }
         .pill.pt-playing { color:var(--success-color, #2e7d32); border-color:currentColor; }
 
+        /* Content: covers like the payload grid; a game's page = a hero (the cover over a blurred copy of itself, always
+           dark, so it reads the same on light and dark themes), big buttons, then glass panels */
+        .gm-glass { background:linear-gradient(135deg, rgba(255,255,255,0.08), rgba(255,255,255,0.02)), var(--card-background-color);
+          border:1px solid var(--divider-color); border-radius:22px; padding:14px 16px; box-shadow:0 10px 34px rgba(0,0,0,0.16);
+          min-width:0; box-sizing:border-box; }
+        .gm-toolbar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:12px; }
+        .gm-toolbar input[type="search"] { flex:1 1 200px; min-width:0; }
+        .gm-grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap:12px; }
+        .gm-card { position:relative; }
+        .gm-card .payload-btn { text-align:left; }
+        .gm-card.gm-live { outline:2px solid var(--success-color, #43a047); outline-offset:-1px; }
+        .gm-art { position:relative; aspect-ratio:1 / 1; display:flex; align-items:center; justify-content:center;
+          background:rgba(127,127,127,0.12); overflow:hidden; }
+        .gm-art img { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; }
+        .gm-art img.gm-noimg { display:none; }
+        .gm-art ha-icon { --mdc-icon-size:48px; color:var(--secondary-text-color); opacity:0.5; }
+        .gm-name { display:block; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+        .gm-sub { display:block; margin-top:2px; font-size:12px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+        .gm-card .ss-badges .pill { background:rgba(0,0,0,0.65); color:#81c784; font-weight:700; letter-spacing:0.6px; }
+
+        .gm-hero { position:relative; overflow:hidden; border-radius:26px; margin-bottom:12px; color:#fff; background:#10141c;
+          border:1px solid rgba(255,255,255,0.12); box-shadow:0 10px 34px rgba(0,0,0,0.42); }
+        .gm-hero.gm-tap { cursor:pointer; }
+        .gm-hero-bg { position:absolute; inset:-60px; background:center / cover no-repeat;
+          filter:blur(48px) saturate(1.4) brightness(0.45); }
+        .gm-hero-glow { position:absolute; inset:0; background:radial-gradient(640px 380px at 22% 40%, var(--gm-glow, rgba(0,112,209,0.22)), transparent 70%),
+          linear-gradient(135deg, rgba(255,255,255,0.08), rgba(255,255,255,0.02)); }
+        .gm-shape { position:absolute; opacity:0.10; animation:gmfloat 10s ease-in-out infinite; }
+        .gm-hero-body { position:relative; display:flex; align-items:center; gap:clamp(16px, 3vw, 36px);
+          padding:clamp(16px, 2.4vw, 28px) clamp(16px, 3vw, 32px); min-height:150px; box-sizing:border-box; }
+        .gm-hero-art { width:clamp(96px, 18vw, 220px); aspect-ratio:1 / 1; border-radius:20px; flex:none; object-fit:cover;
+          display:flex; align-items:center; justify-content:center; background:rgba(255,255,255,0.04);
+          box-shadow:0 24px 60px rgba(0,0,0,0.6), 0 0 0 1px rgba(255,255,255,0.10); }
+        .gm-hero-art ha-icon { --mdc-icon-size:clamp(56px, 9vw, 110px); color:#4f9be8; opacity:0.85; }
+        .gm-hero-text { flex:1; min-width:0; }
+        .gm-eyebrow { font-size:12px; letter-spacing:2.4px; text-transform:uppercase; color:rgba(255,255,255,0.65); margin-bottom:8px; }
+        .gm-title { font-size:clamp(24px, 3.4vw, 46px); font-weight:600; line-height:1.08; overflow-wrap:anywhere;
+          display:-webkit-box; -webkit-line-clamp:3; -webkit-box-orient:vertical; overflow:hidden; }
+        .gm-title.gm-long { font-size:clamp(20px, 2.6vw, 34px); }
+        .gm-status { display:flex; align-items:center; gap:14px; flex-wrap:wrap; margin-top:14px; }
+        .gm-pill { display:inline-flex; align-items:center; gap:8px; padding:6px 14px; border-radius:999px; font-size:13px;
+          font-weight:600; letter-spacing:0.8px; color:var(--gm-acc); background:var(--gm-acc-bg); border:1px solid var(--gm-acc-line); }
+        .gm-pill .gm-dot { width:9px; height:9px; border-radius:50%; background:var(--gm-acc); box-shadow:0 0 8px var(--gm-acc); }
+        .gm-pill.gm-pulse .gm-dot { animation:gmpulse 2s ease-in-out infinite; }
+        .gm-st-playing { --gm-acc:#81c784; --gm-acc-bg:rgba(129,199,132,0.13); --gm-acc-line:rgba(129,199,132,0.33); }
+        .gm-st-on { --gm-acc:#90caf9; --gm-acc-bg:rgba(144,202,249,0.13); --gm-acc-line:rgba(144,202,249,0.33); }
+        .gm-st-rest { --gm-acc:#ffb74d; --gm-acc-bg:rgba(255,183,77,0.13); --gm-acc-line:rgba(255,183,77,0.33); }
+        .gm-st-off { --gm-acc:#b4bac6; --gm-acc-bg:rgba(180,186,198,0.10); --gm-acc-line:rgba(180,186,198,0.28); }
+        /* in a panel (the theme's card, light or dark): the theme's colors, not the hero's pale ones */
+        .gm-glass .gm-st-playing { --gm-acc:var(--success-color, #43a047); --gm-acc-bg:rgba(67,160,71,0.12); --gm-acc-line:rgba(67,160,71,0.35); }
+        .gm-glass .gm-st-on { --gm-acc:var(--info-color, #039be5); --gm-acc-bg:rgba(3,155,229,0.12); --gm-acc-line:rgba(3,155,229,0.35); }
+        .gm-glass .gm-st-off { --gm-acc:var(--secondary-text-color); --gm-acc-bg:rgba(127,127,127,0.10); --gm-acc-line:rgba(127,127,127,0.30); }
+        .gm-timer { display:inline-flex; align-items:center; gap:6px; font-size:clamp(18px, 2vw, 26px); font-weight:600; }
+        .gm-timer ha-icon { --mdc-icon-size:24px; color:#81c784; }
+        .gm-hero-sub { margin-top:10px; font-size:14px; color:rgba(255,255,255,0.7); }
+        .gm-chips { margin-top:14px; }
+        .gm-chip { display:inline-flex; align-items:center; gap:6px; padding:5px 11px; margin:0 6px 6px 0; border-radius:999px;
+          background:rgba(255,255,255,0.07); border:1px solid rgba(255,255,255,0.10); font-size:12.5px; color:#fff; }
+        .gm-chip.gm-mono { font-family:monospace; }
+        .gm-back { margin-bottom:10px; }
+
+        .gm-ctls { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:10px; margin-bottom:12px; }
+        .gm-ctl { cursor:pointer; min-height:74px; padding:10px 6px 8px; border-radius:6px; display:flex; flex-direction:column;
+          align-items:center; justify-content:center; gap:4px; font-size:13px; font-weight:600; color:var(--primary-text-color);
+          background:linear-gradient(135deg, rgba(255,255,255,0.08), rgba(255,255,255,0.02)), var(--card-background-color);
+          border:1px solid var(--divider-color); box-shadow:0 6px 20px rgba(0,0,0,0.12); }
+        .gm-ctl:hover { background:var(--secondary-background-color); }
+        .gm-ctl ha-icon { --mdc-icon-size:26px; color:var(--gm-ic, #4f9be8); }
+        .gm-ctl .gm-why { font-size:11px; font-weight:400; color:var(--secondary-text-color); text-align:center; }
+
+        .gm-panels { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:12px; align-items:stretch; }
+        .gm-head { display:flex; justify-content:space-between; align-items:center; gap:8px; margin-bottom:12px; font-size:11.5px;
+          font-weight:700; letter-spacing:1.2px; text-transform:uppercase; color:var(--secondary-text-color); }
+        .gm-head span { text-transform:none; letter-spacing:0; font-weight:500; }
+        .gm-tiles { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:8px; }
+        .gm-tile { padding:12px 10px; border-radius:16px; background:rgba(127,127,127,0.07); border:1px solid var(--divider-color); min-width:0; }
+        .gm-tile-label { font-size:11px; letter-spacing:1.6px; color:var(--secondary-text-color); }
+        .gm-tile-num { font-size:clamp(20px, 2.2vw, 28px); font-weight:600; margin-top:4px; }
+        .gm-tile-sub { font-size:11.5px; color:var(--secondary-text-color); margin-top:2px; }
+        .gm-bars { display:flex; align-items:flex-end; gap:2px; height:64px; margin-top:14px; }
+        .gm-bar { flex:1; min-height:2px; border-radius:3px 3px 0 0; background:var(--success-color, #43a047); }
+        .gm-bar.gm-zero { background:var(--divider-color); }
+        .gm-bar-axis { display:flex; justify-content:space-between; font-size:11px; color:var(--secondary-text-color); margin-top:4px; }
+        .gm-rows { margin-top:12px; }
+        .gm-row { display:flex; justify-content:space-between; align-items:center; gap:10px; padding:7px 2px; font-size:13px;
+          border-bottom:1px solid var(--divider-color); }
+        .gm-row:last-child { border-bottom:none; }
+        .gm-row > :first-child { min-width:0; overflow-wrap:anywhere; }
+        .gm-row > :last-child { flex:none; text-align:right; }
+        .gm-big { font-size:clamp(22px, 2.4vw, 30px); font-weight:600; }
+        .gm-user { margin-top:12px; font-size:12px; font-weight:600; color:var(--secondary-text-color); }
+        .gm-shots { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:8px; }
+        .gm-shot { position:relative; padding:0; border:none; border-radius:10px; overflow:hidden; aspect-ratio:16 / 9; cursor:pointer;
+          background:rgba(127,127,127,0.12); color:#fff; }
+        .gm-shot img { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; }
+        .gm-shot-cap { position:absolute; inset:auto 0 0 0; padding:18px 8px 6px; text-align:left; font-size:11.5px;
+          background:linear-gradient(transparent, rgba(0,0,0,0.78)); }
+        .gm-shot .ss-badges .pill { font-size:11px; padding:2px 7px; }
+        .gm-trophy { color:#ffd740!important; }
+        .gm-note { margin-top:10px; }
+        @keyframes gmpulse { 0%, 100% { opacity:1; } 50% { opacity:0.35; } }
+        @keyframes gmfloat { 0%, 100% { transform:translateY(0) rotate(0deg); } 50% { transform:translateY(-10px) rotate(6deg); } }
+        @media (prefers-reduced-motion: reduce) { .gm-shape, .gm-pill .gm-dot { animation:none!important; } }
+        @media (max-width: 1000px) {
+          .gm-panels { grid-template-columns:repeat(2, minmax(0, 1fr)); }
+          .gm-panels > .gm-span { grid-column:1 / -1; }
+        }
+        @media (max-width: 700px) {
+          .gm-panels { grid-template-columns:minmax(0, 1fr); }
+          .gm-hero-body { flex-direction:column; align-items:flex-start; }
+          .gm-ctls { gap:8px; }
+        }
+
         /* Saves: two panes, On PS4 | In HA, side by side; one at a time below 900 px (a toggle) */
         .sv-panes { display:grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap:20px; align-items:start; }
         .sv-pane { min-width:0; }
@@ -1777,7 +2723,8 @@ class PS4GoldHENPanel extends HTMLElement {
         .sv-pane .sticky-bar { margin:0; padding:8px 0; }
         .sv-pane-toggle { display:none; margin-bottom:10px; }
         .sv-progress { margin-bottom:10px; }
-        .sv-progress-text { display:flex; justify-content:space-between; gap:8px; margin-bottom:6px; }
+        .sv-progress-text { display:flex; justify-content:space-between; align-items:center; gap:8px; margin-bottom:6px; }
+        .sv-progress-end { display:flex; align-items:center; gap:8px; }
         .sv-progress-track { height:8px; border-radius:4px; background:var(--divider-color); overflow:hidden; }
         .sv-progress-fill { height:100%; background:var(--primary-color); }
         .sv-progress-wait { opacity:0.35; }
@@ -1829,6 +2776,8 @@ class PS4GoldHENPanel extends HTMLElement {
           .ss-settings { grid-template-columns: minmax(0, 1fr); gap:4px; }
           .ss-settings > :nth-child(even) { margin-bottom:8px; }
           .ss-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap:8px; }
+          .gm-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); gap:8px; }
+          .gm-card .payload-name { padding:6px; font-size:12px; }
           .ss-card .payload-name { padding:6px; font-size:12px; }
           .ss-card .payload-sendrow { padding:6px; }
           .sv-grow { flex-wrap:wrap; }
@@ -1856,21 +2805,23 @@ class PS4GoldHENPanel extends HTMLElement {
               })
               .join("")}
           </select>
-          <button class="btn" id="btn-reload-entries">Reload</button>
+          ${this._renderPower()}
         </div>
       </div>
 
       <div class="tabs">
-        <button class="tabbtn ${this._tab === "ftp" ? "active" : ""}" data-tab="ftp">FTP</button>
-        <button class="tabbtn ${this._tab === "binloader" ? "active" : ""}" data-tab="binloader">Payloads</button>
-        <button class="tabbtn ${this._tab === "klog" ? "active" : ""}" data-tab="klog">Klog</button>
+        <button class="tabbtn ${this._tab === "games" ? "active" : ""}" data-tab="games">Content</button>
         <button class="tabbtn ${this._tab === "saves" ? "active" : ""}" data-tab="saves">Saves</button>
         <button class="tabbtn ${this._tab === "screenshots" ? "active" : ""}" data-tab="screenshots">Screenshots</button>
         <button class="tabbtn ${this._tab === "playtime" ? "active" : ""}" data-tab="playtime">Play time</button>
+        <button class="tabbtn ${this._tab === "ftp" ? "active" : ""}" data-tab="ftp">FTP</button>
+        <button class="tabbtn ${this._tab === "binloader" ? "active" : ""}" data-tab="binloader">Payloads</button>
+        <button class="tabbtn ${this._tab === "klog" ? "active" : ""}" data-tab="klog">Klog</button>
       </div>
 
       ${this._loading ? `<div class="loading">Processing...</div>` : ""}
 
+      ${this._tab === "games" ? this._renderGames() : ""}
       ${this._tab === "ftp" ? this._renderFtp() : ""}
       ${this._tab === "binloader" ? this._renderBinLoader() : ""}
       ${this._tab === "klog" ? this._renderKlog() : ""}
@@ -1883,6 +2834,8 @@ class PS4GoldHENPanel extends HTMLElement {
       ${this._tab === "screenshots" && this._ssDelete ? this._renderSsDelete() : ""}
       ${this._tab === "saves" && this._svConfirm ? this._renderSvConfirm() : ""}
       ${this._tab === "binloader" && this._plConfirm ? this._renderPlConfirm() : ""}
+      ${this._tab === "games" && this._gm.confirm ? this._renderGmConfirm() : ""}
+      ${this._pw.confirm ? this._renderPwConfirm() : ""}
     `;
 
     const menu = this.shadowRoot.querySelector("#btn-menu");
@@ -1897,6 +2850,10 @@ class PS4GoldHENPanel extends HTMLElement {
     if (sel) {
       sel.onchange = async () => {
         this._selectEntry(sel.value);
+        if (this._tab === "games") {
+          await this._gmLoad();  // HA only, never the PS4
+          return;
+        }
         if (this._tab === "screenshots") {
           await this._ssLoad();  // no FTP listing of / for this tab
           return;
@@ -1914,16 +2871,12 @@ class PS4GoldHENPanel extends HTMLElement {
       };
     }
 
-    const reloadBtn = this.shadowRoot.querySelector("#btn-reload-entries");
-    if (reloadBtn) {
-      reloadBtn.onclick = async () => {
-        this._setLoading(true);
-        await this._loadEntries();
-        await this._loadPayloads();
-        this._setLoading(false);
-        if (this._selectedEntryId) await this._loadDir("/");
-      };
-    }
+    const powerBtn = this.shadowRoot.querySelector("#btn-power");
+    if (powerBtn) powerBtn.onclick = () => this._pwClick(powerBtn.dataset.power);
+    const pwCancel = this.shadowRoot.querySelector("#pw-confirm-cancel");
+    if (pwCancel) pwCancel.onclick = () => this._closeOverlay();
+    const pwGo = this.shadowRoot.querySelector("#pw-confirm-go");
+    if (pwGo) pwGo.onclick = () => this._pwRun("rest");
 
     this.shadowRoot.querySelectorAll(".tabbtn").forEach((b) => {
       b.onclick = () => {
@@ -1949,18 +2902,29 @@ class PS4GoldHENPanel extends HTMLElement {
           this._svStopPoll();
           this._svConfirm = null;
         }
+        if (this._tab === "games" && nextTab !== "games") {
+          this._gmStopPoll();
+          this._gm.confirm = null;
+          this._ssView = null;
+        }
 
         const opening = nextTab === "screenshots" && this._tab !== "screenshots";
         const openingPt = nextTab === "playtime" && this._tab !== "playtime";
         const openingSv = nextTab === "saves" && this._tab !== "saves";
+        const openingGm = nextTab === "games" && this._tab !== "games";
+        // the first FTP listing waits for the FTP tab (the panel opens on Games)
+        const openingFtp = nextTab === "ftp" && this._tab !== "ftp" && !this._ftpListed;
         this._tab = nextTab;
         this._render();
         if (opening) this._ssLoad();  // the PS4 is only asked when the tab opens or on Refresh
         if (openingPt) this._ptLoad();
         if (openingSv) this._svLoad();
+        if (openingGm) this._gmLoad();
+        if (openingFtp) this._loadDir("/");
       };
     });
 
+    if (this._tab === "games") this._bindGamesEvents();
     if (this._tab === "screenshots") this._bindScreenshotsEvents();
     if (this._tab === "playtime") this._bindPlayTimeEvents();
     if (this._tab === "saves") this._bindSavesEvents();
@@ -2057,21 +3021,27 @@ class PS4GoldHENPanel extends HTMLElement {
   }
 
   _renderFtp() {
+    const asleep = this._ftpAsleep();
+    const off = asleep ? "disabled" : "";
+    const sleeping = this._pwState()?.power === "rest" ? "in rest mode" : "off";
+    const status = asleep ? `The PS4 is ${sleeping}: turn it on to browse its files.`
+      : !this._ftpListed && !this._ftpError && !this._loading ? "Refresh to list the PS4's files." : "";
     return html`
       <div class="header">
         <div class="path">PS4 FTP: ${this._escapeHtml(this._path)}</div>
         <div class="nav-btns">
-          <button id="btn-root">Root</button>
-          <button id="btn-back">Back</button>
-          <button id="btn-refresh">Refresh</button>
+          <button id="btn-root" ${off}>Root</button>
+          <button id="btn-back" ${off}>Back</button>
+          <button id="btn-refresh" ${off}>Refresh</button>
         </div>
         <div class="upload-section">
           <input type="file" id="ftp-upload-input" style="display:none">
-          <button id="btn-ftp-select">Select file</button>
-          <button id="btn-ftp-upload">Upload to current folder</button>
+          <button class="btn" id="btn-ftp-select" ${off}>Select file</button>
+          <button class="btn" id="btn-ftp-upload" ${off}>Upload to current folder</button>
         </div>
       </div>
-      ${this._ftpError ? `<div class="ss-warn">${this._escapeHtml(this._ftpError)}</div>` : ""}
+      ${status ? `<div class="muted bar-status">${status}</div>` : ""}
+      ${this._ftpError && !asleep ? `<div class="ss-warn">${this._escapeHtml(this._ftpError)}</div>` : ""}
 
       <table>
         <thead>
@@ -2169,7 +3139,14 @@ class PS4GoldHENPanel extends HTMLElement {
     this._ssDialog = null;    // Sync dialog: {plan, kind, titleId, count}
     this._ssView = null;      // full-size viewer: {url, shot, note, failed}
     this._ssDelete = null;    // delete dialog: {ha, ps4}
+    this._ssRead = null;      // the last list answer: {asleep, read_at}
     this._ssPollTimer = null;
+  }
+
+  // Known to be in rest mode or off: HA uses no FTP then (the list is HA's last read; Sync and PS4 deletes wait)
+  _ssAsleep() {
+    const power = this._ssSettings?.power_state;
+    return power === "rest" || power === "off";
   }
 
   _ssStopPoll() {
@@ -2219,14 +3196,16 @@ class PS4GoldHENPanel extends HTMLElement {
     const entryId = this._selectedEntryId;
     const offset = reset ? 0 : this._ssShots.length;
     this._ssBusy = true;
-    this._ssStatus = reset ? "Reading the PS4's newest screenshots..." : "Loading more...";
+    this._ssStatus = this._ssAsleep() ? "" : reset ? "Reading the PS4's newest screenshots..." : "Loading more...";
     this._render();
     try {
       const resp = await this._ssCall("list", { offset, count: this._ssPage });
       if (entryId !== this._selectedEntryId) return;
       this._ssShots = reset ? resp.shots : this._ssShots.concat(resp.shots);
       this._ssMore = resp.more;
-      this._ssStatus = this._ssShots.length ? "" : "No screenshots on this PS4 yet.";
+      this._ssRead = { asleep: resp.asleep, read_at: resp.read_at };
+      if (resp.power_state !== undefined) this._ssSettings = { ...this._ssSettings, power_state: resp.power_state };
+      this._ssStatus = this._ssShots.length || resp.asleep ? "" : "No screenshots on this PS4 yet.";
     } catch (e) {
       this._ssStatus = `${e.message || e}`;
     } finally {
@@ -2269,6 +3248,11 @@ class PS4GoldHENPanel extends HTMLElement {
       this._render();
       return;
     }
+    await this._ssOpenView(shot);
+  }
+
+  // the full-size viewer (Screenshots tab + a game's page)
+  async _ssOpenView(shot) {
     const asleep = !shot.in_ha && this._ssSettings.power_state !== "on";
     const view = { url: null, shot, note: asleep ? "The PS4 is in rest mode or off: turn it on to see this one full size." : "" };
     this._ssView = view;
@@ -2452,8 +3436,10 @@ class PS4GoldHENPanel extends HTMLElement {
         <div class="editor-container">
           <h3 style="margin-top:0">Delete ${plural(n, "screenshot", "screenshots")}: ${this._escapeHtml(this._entryName(this._selectedEntry()))}</h3>
           ${haBox}
-          <label><input type="checkbox" id="ss-del-ps4" ${d.ps4 ? "checked" : ""}>
-            PS4 original</label>
+          ${this._ssAsleep()
+            ? `<label class="muted"><input type="checkbox" disabled> PS4 original (the PS4 is in rest mode or off)</label>`
+            : `<label><input type="checkbox" id="ss-del-ps4" ${d.ps4 ? "checked" : ""}>
+            PS4 original</label>`}
           ${d.ps4 ? `<div class="ss-warn">Deleting from the PS4 is permanent: the console's own copy is gone, HA's copy stays only if "HA copy" is unticked.</div>` : ""}
           ${what ? "" : `<div class="muted">Tick what to delete.</div>`}
           <div class="editor-actions">
@@ -2498,16 +3484,21 @@ class PS4GoldHENPanel extends HTMLElement {
     const ticked = this._ssSelected.size;
     const hint = !ticked ? "Tap shots to tick them"
       : !picked ? `${ticked === 1 ? "It's" : "They're"} already in HA` : ticked > picked ? `${ticked - picked} already in HA` : "";
+    const asleep = this._ssAsleep();
+    const sleeping = s.power_state === "rest" ? "in rest mode" : "off";
+    const readLine = !asleep ? ""
+      : this._ssRead?.read_at ? `The PS4 is ${sleeping}: this is what HA read ${this._when(new Date(this._ssRead.read_at))}.`
+      : `The PS4 is ${sleeping}: turn it on to see its screenshots.`;
     const toolbar = this._ssSelecting
       ? html`
-          <button class="btn btn-save" id="ss-copy-selected" ${picked && !s.syncing ? "" : "disabled"}>Sync ${picked} to HA</button>
+          <button class="btn btn-save" id="ss-copy-selected" ${picked && !s.syncing && !asleep ? "" : "disabled"}>Sync ${picked} to HA</button>
           <button class="btn" id="ss-delete" ${ticked && !s.syncing && !this._ssBusy ? "" : "disabled"}>Delete ${ticked}...</button>
           <button class="btn" id="ss-select">Cancel</button>
           ${hint ? `<span class="muted">${hint}</span>` : ""}`
       : html`
-          <button class="btn" id="ss-sync" ${s.syncing || this._ssBusy ? "disabled" : ""}>Sync all...</button>
+          <button class="btn" id="ss-sync" ${s.syncing || this._ssBusy || asleep ? "disabled" : ""}>Sync all...</button>
           <button class="btn" id="ss-select">Select</button>
-          <button class="btn" id="ss-refresh" ${this._ssBusy ? "disabled" : ""}>Refresh</button>`;
+          <button class="btn" id="ss-refresh" ${this._ssBusy || asleep ? "disabled" : ""}>Refresh</button>`;
     // one line per game name (even card heights), "Unknown game" for a bare title ID, a pill only
     // for "In HA"
     const cards = this._ssShots.map((shot) => {
@@ -2539,6 +3530,7 @@ class PS4GoldHENPanel extends HTMLElement {
             ${toolbar}
             ${s.syncing ? `<span class="pill">Syncing ${s.progress.done} / ${s.progress.total}...</span>` : ""}
           </div>
+          ${readLine ? `<div class="muted bar-status">${this._escapeHtml(readLine)}</div>` : ""}
           ${this._ssStatus ? `<div class="muted bar-status">${this._escapeHtml(this._ssStatus)}</div>` : ""}
         </div>
         <div class="ss-grid" id="ss-grid">${cards}</div>
@@ -2567,7 +3559,7 @@ class PS4GoldHENPanel extends HTMLElement {
             <span class="muted">${this._escapeHtml(game)} · ${this._escapeHtml(this._ssTaken(shot.taken))} · ${this._escapeHtml(shot.name)}</span>
             <span class="row" style="margin:0">
               ${where}
-              ${shot.in_ha ? "" : `<button class="btn btn-save" id="ss-view-sync" ${this._ssBusy || this._ssSettings.syncing ? "disabled" : ""}>Sync to HA</button>`}
+              ${shot.in_ha ? "" : `<button class="btn btn-save" id="ss-view-sync" ${this._ssBusy || this._ssSettings.syncing || this._ssAsleep() ? "disabled" : ""}>Sync to HA</button>`}
               ${url && !failed ? `<a href="${safeUrl}" target="_blank" rel="noopener">Open full size</a>` : ""}
               <button class="btn" id="ss-view-close">Close</button>
             </span>
@@ -2620,6 +3612,27 @@ class PS4GoldHENPanel extends HTMLElement {
       </div>`;
   }
 
+  _bindSsViewEvents() {
+    const $ = (sel) => this.shadowRoot.querySelector(sel);
+    const close = $("#ss-view-close");
+    if (close) close.onclick = () => {
+      this._ssView = null;
+      this._render();
+    };
+    const sync = $("#ss-view-sync");
+    if (sync) sync.onclick = () => this._ssViewSync();
+    const viewImg = $("#ss-view-img");
+    if (viewImg && this._ssView) {
+      const view = this._ssView;
+      viewImg.onerror = () => {
+        if (this._ssView !== view || view.failed) return;
+        view.failed = true;
+        view.note = view.shot.in_ha ? "Couldn't load HA's copy." : "Couldn't read it from the PS4 (is it on, with GoldHEN's FTP enabled?).";
+        this._render();
+      };
+    }
+  }
+
   _bindScreenshotsEvents() {
     const $ = (sel) => this.shadowRoot.querySelector(sel);
     const on = (sel, fn) => {
@@ -2665,21 +3678,7 @@ class PS4GoldHENPanel extends HTMLElement {
       const b = ev.target.closest("button[data-rel]");
       if (b) this._ssCardClick(b.dataset.rel);
     });
-    on("#ss-view-close", () => {
-      this._ssView = null;
-      this._render();
-    });
-    on("#ss-view-sync", () => this._ssViewSync());
-    const viewImg = $("#ss-view-img");
-    if (viewImg && this._ssView) {
-      const view = this._ssView;
-      viewImg.onerror = () => {
-        if (this._ssView !== view || view.failed) return;
-        view.failed = true;
-        view.note = view.shot.in_ha ? "Couldn't load HA's copy." : "Couldn't read it from the PS4 (is it on, with GoldHEN's FTP enabled?).";
-        this._render();
-      };
-    }
+    this._bindSsViewEvents();
     const d = this._ssDialog;
     if (!d) return;
     this.shadowRoot.querySelectorAll('input[name="ss-kind"]').forEach((r) => {

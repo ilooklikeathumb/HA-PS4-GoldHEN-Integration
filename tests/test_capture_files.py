@@ -213,6 +213,21 @@ class Walk(unittest.TestCase):
         ftp = FakeFTP(FakeConsole())
         self.assertEqual(cf.all_shots(ftp), [])
         self.assertEqual(cf.newest_shots(ftp, 24), [])
+        self.assertEqual(cf.newest_shots(ftp, 6, "CUSA90005"), [])
+
+    def test_one_game_lists_only_its_folders(self):  # the game page: no walk of every game
+        c = live_like_console()
+        c.add_shot("CUSA90006", "a01", "20261016_100000_00000001.jpg", "20261016140000")
+        c.add_shot("CUSA90005", "b02", "20261016_110000_00000002.jpg", "20261016150000", app="CUSA90005")  # in-game share
+        ftp = FakeFTP(c)
+        shots = cf.all_shots(ftp, "CUSA90005")
+        self.assertEqual([s["name"] for s in shots], [
+            "20261016_110000_00000002.jpg", "20261015_111203_00205776.jpg", "20261015_110310_00680394.jpg"])
+        self.assertEqual({s["title_id"] for s in shots}, {"CUSA90005"})
+        self.assertNotIn(f"{P}/NPXS20001", ftp.listings)  # the apps' game folders aren't listed
+        self.assertFalse(any("CUSA90006" in p or p.endswith("/NPXS20001/NPXS20001") for p in ftp.listings))
+        self.assertEqual([s["name"] for s in cf.newest_shots(FakeFTP(c), 1, "CUSA90005")], ["20261016_110000_00000002.jpg"])
+        self.assertEqual(cf.list_buckets(FakeFTP(c), "../x"), [])  # only a title ID's shape is listed
 
     def test_shot_by_rel(self):
         ftp = FakeFTP(live_like_console())

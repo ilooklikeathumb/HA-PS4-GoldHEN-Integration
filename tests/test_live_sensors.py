@@ -266,6 +266,31 @@ class LineTests(unittest.TestCase):
         live.async_check(hass, entry)
         self.assertIsNone(data["coordinator"].data[const.SENSOR_CPU_TEMP])  # no old value left behind
 
+    def test_a_field_missing_from_a_line_goes_unavailable(self):
+        """Each reading is as current as the last line: a field the line lacks (or an out-of-range value) goes
+        unavailable, the others stay."""
+        hass, entry, data = make_hass()
+        live.async_handle_line(hass, "E1", LINE)
+        for line in (LINE.replace("soc=88;", ""), LINE.replace("soc=88", "soc=200")):
+            with self.subTest(line=line):
+                CLOCK[0] += 30
+                live.async_handle_line(hass, "E1", line)
+                self.assertIsNone(data["coordinator"].data[const.SENSOR_SOC_TEMP])
+                self.assertFalse(live.is_live(hass, "E1", const.SENSOR_SOC_TEMP))
+                self.assertTrue(live.is_live(hass, "E1", const.SENSOR_CPU_TEMP))
+                self.assertEqual(data["coordinator"].data[const.SENSOR_CPU_TEMP], 88)
+        live.async_handle_line(hass, "E1", LINE.replace("thr=83;", ""))
+        self.assertIsNone(fan.console_value(hass, "E1"), "the fan target too")
+        live.async_handle_line(hass, "E1", LINE)
+        self.assertTrue(live.is_live(hass, "E1", const.SENSOR_SOC_TEMP))
+        self.assertEqual(fan.console_value(hass, "E1"), 83)
+
+    def test_each_sensor_checks_its_own_field(self):
+        tree = ast.parse((COMP / "sensor.py").read_text())
+        keys = [ast.unparse(c.args[2]) for c in ast.walk(tree)
+                if isinstance(c, ast.Call) and ast.unparse(c.func) == "live_sensors.is_live"]
+        self.assertEqual(sorted(keys), ["SENSOR_CPU_TEMP", "SENSOR_FAN_DUTY", "SENSOR_SOC_TEMP"])
+
     def test_rest_or_off_is_unavailable(self):
         hass, entry, data = make_hass()
         live.async_handle_line(hass, "E1", LINE)
@@ -781,6 +806,37 @@ class FanControlTests(unittest.TestCase):
         run(body)
         self.assertEqual(self.sent_values(), [72, 79])
         self.assertFalse(data["fan"]["restore_pending"])
+
+    def test_off_in_rest_survives_an_ha_restart(self):
+        """Off while the console rests, then HA restarts before it wakes: the console still gets its own target back."""
+        hass, entry, data = self.hass_answering()
+
+        async def body():
+            await fan.async_load(hass, entry)
+            live.async_handle_line(hass, "E1", LINE.replace("thr=83", "thr=79"))
+            await fan.async_set_wanted(hass, entry, 72, send=False)
+            await fan.async_set_enabled(hass, entry, True, send=True)
+            data["coordinator"].data["power_state"] = "rest"
+            await fan.async_set_enabled(hass, entry, False, send=True)  # pending: the console sleeps
+            return entry
+        run(body)
+        self.assertEqual(self.sent_values(), [72])
+        SENT_BYTES.clear()
+        ON_BYTES_SEND.clear()
+        hass, entry, data = self.hass_answering(power="rest")  # restarted while the console rests
+
+        async def after():
+            await fan.async_load(hass, entry)
+            await fan.async_set_enabled(hass, entry, False, send=False)  # the switch restores off
+            self.assertEqual(fan.off_value(hass, "E1"), 79)
+            data["coordinator"].data["power_state"] = "on"
+            live.async_handle_line(hass, "E1", LINE.replace("thr=83", "thr=72"))  # woke, still on HA's 72
+            await asyncio.gather(*entry.tasks)
+            return entry
+        run(after)
+        self.assertEqual(self.sent_values(), [79])
+        self.assertFalse(data["fan"]["restore_pending"])
+        self.assertIsNone(Store.SAVED[f"{const.DOMAIN}.fan.E1"].get("restore_to"), "landed: nothing owed any more")
 
     def test_on_again_before_the_off_landed_keeps_the_own_value(self):
         hass, entry, data = self.hass_answering()

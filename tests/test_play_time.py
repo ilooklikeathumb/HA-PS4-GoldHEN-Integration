@@ -285,6 +285,35 @@ class BookTests(unittest.TestCase):
                          [(GAME_D, True, True), (GAME_E, False, False)])
         json.dumps(s)
 
+    def test_title_summary(self):  # the game page: one game, its last 30 local days, its own sessions
+        b = book({"games": {GAME_E: {"name": "Game E", "seconds": 5400, "sessions": 2,
+                                    "first": "2026-09-01T20:00:00+00:00", "last": "2026-10-10T20:00:00+00:00"}},
+                  "days": {"2026-09-01": {GAME_E: 1800}, "2026-10-10": {GAME_E: 3600, GAME_D: 60},
+                           "2026-10-16": {GAME_D: 0.0}},
+                  "sessions": [
+                      {"title_id": GAME_E, "name": "Game E", "start": "2026-09-01T19:30:00+00:00",
+                       "end": "2026-09-01T20:00:00+00:00", "seconds": 1800},
+                      {"title_id": GAME_D, "name": "Game D", "start": "2026-10-10T18:00:00+00:00",
+                       "end": "2026-10-10T18:01:00+00:00", "seconds": 60},
+                      {"title_id": GAME_E, "name": "Game E", "start": "2026-10-10T19:00:00+00:00",
+                       "end": "2026-10-10T20:00:00+00:00", "seconds": 3600}], "open": None})
+        b.start(GAME_E, "Game E", T0)
+        for i in range(1, 11):
+            b.accrue(T0 + mins(i))
+        s = b.title_summary(GAME_E, T0 + mins(10))
+        self.assertEqual((s["seconds"], s["sessions"], s["first"]), (6000, 3, "2026-09-01T20:00:00+00:00"))
+        self.assertEqual((s["week"], s["month"]), (4200, 4200))  # Oct 10 is in the 7 days; Sep 1 past the 30
+        self.assertEqual(len(s["days"]), pt.GAME_DAYS)
+        self.assertEqual(s["days"][-1], {"day": "2026-10-16", "seconds": 600})  # today (local), last
+        self.assertEqual(s["days"][-7]["day"], "2026-10-10")
+        self.assertEqual(s["days"][-7]["seconds"], 3600)  # Game D's minute that day isn't counted
+        self.assertEqual(s["days"][0]["day"], "2026-09-17")
+        self.assertEqual([(x["start"][:10], x["open"], x["playing"]) for x in s["recent"]],
+                         [("2026-10-16", True, True), ("2026-10-10", False, False), ("2026-09-01", False, False)])
+        self.assertEqual(b.title_summary("CUSA00000", T0)["seconds"], 0)  # never played: zeros, no error
+        self.assertEqual(b.title_summary("CUSA00000", T0)["recent"], [])
+        json.dumps(s)
+
 
 def replay_into_book(lines):
     sm, tracker, b = KlogStateMachine(), gs.GameSessionTracker(), book()

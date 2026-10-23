@@ -2,7 +2,8 @@
 
 A precaution, not a proven GoldHEN limit (a second FTP client alongside HA worked in testing). Every FTP session HA
 opens to a console takes that console's FTP lock: screenshots, save backup, the cover fetch, the app.db pull and the panel's file
-browser, upload and download. A panel action waits at most FTP_BUSY_WAIT for it, then reports FTP as busy.
+browser, upload and download. A panel action waits at most FTP_BUSY_WAIT for it, then reports FTP as busy; on a
+console known to be in rest mode or off it's refused at once (check_awake).
 capture_files.connect still retries a refused connect: an FTP client outside HA (on a PC) may be using the console.
 """
 from __future__ import annotations
@@ -14,13 +15,24 @@ from typing import Any, Callable
 from homeassistant.core import HomeAssistant
 
 from . import capture_files as cf
-from .const import DOMAIN
+from .const import DOMAIN, POWER_OFF, POWER_REST
 
 FTP_BUSY_WAIT = 60  # s a panel action waits for the lock before it gives up
 
 
 class FTPBusy(Exception):
     """The console's FTP lock stayed taken for the whole wait."""
+
+
+class ConsoleAsleep(Exception):
+    """The console is known to be in rest mode or off: no FTP until it's on."""
+
+
+def check_awake(data: dict[str, Any]) -> None:
+    """The panel's FTP tab: an unknown power state (klog not connected yet) still tries."""
+    coordinator = data.get("coordinator")
+    if ((coordinator.data if coordinator else None) or {}).get("power_state") in (POWER_REST, POWER_OFF):
+        raise ConsoleAsleep("The PS4 is in rest mode or off: turn it on first (HA doesn't use FTP on a sleeping PS4)")
 
 
 def lock(data: dict[str, Any]) -> asyncio.Lock:

@@ -22,10 +22,14 @@ def load_integration():
         def __init__(self, hass, logger, *, update_method, **kwargs):
             self.update_method = update_method
             self.data = None
+            self.listeners = []
         async def async_config_entry_first_refresh(self):
             self.data = await self.update_method()
         def async_set_updated_data(self, data):
             self.data = data
+        def async_add_listener(self, update_callback, context=None):
+            self.listeners.append(update_callback)
+            return lambda: self.listeners.remove(update_callback)
 
     class Flow:
         def __init_subclass__(cls, **kwargs):
@@ -326,6 +330,9 @@ class SocketTests(unittest.IsolatedAsyncioTestCase):
                 hook.assert_called_once()
         fan_load.assert_awaited_once()
         self.assertEqual(len(tasks), 2)
+        coordinator = hass.data["ps4_goldhen"]["entry"]["coordinator"]
+        self.assertEqual([listener.func.__name__ for listener in coordinator.listeners], ["_watch_wake"],
+                         "the app.db task hears about wakes")
         hass.config_entries.async_forward_entry_setups.assert_awaited_once()
         return hass.data["ps4_goldhen"]["entry"]["coordinator"].data
 

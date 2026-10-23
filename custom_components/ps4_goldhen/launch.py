@@ -1,16 +1,17 @@
-"""Start and close games from HA: the media player's source list + game browser, the "Close game"
-button, and bringing back the suspended game after a wake.
+"""Start and close games and apps from HA: the media player's source list + media browser, the "Close application"
+button + the `close_title` service, and bringing back the suspended game after a wake.
 
 Sends the integration's own `launch_payload/launch-app.elf` to GoldHEN's BinLoader (port 9090) with the
 title ID written into it: the ELF holds a 16-byte marker that is replaced by the title ID (bytes 0-9, NUL-padded; all
 NUL = no title) and a flag in byte 10: `K` = close the running game first, `R` (no title) = only bring back the
-suspended game. The payload calls what Itemzflow calls: `sceSystemServiceKillApp(sceSystemServiceGetAppIdOfBigApp(),
+suspended game, `C` = only close this title (game or app, in front or in the background). The payload calls what Itemzflow calls: `sceSystemServiceKillApp(sceSystemServiceGetAppIdOfBigApp(),
 -1, 0, 0)` to close, then `sceLncUtilLaunchApp` with SkipSystemUpdateCheck for the logged-in user; source and build in
 `payload_src/launch-app/` (ps4-payload-dev/sdk, GPL-3+). Result on klog: `ps4_goldhen launch: <title ID> -> 0x<code>`;
 the media player follows from AppFocusChanged.
 
 Picking a game while another one runs closes that one without asking: picking means switching.
-Without the close, the console itself asks "The following application will close" on the TV.
+Without the close, the console itself asks "The following application will close" on the TV. An app is sent without
+the close: an app like Spotify runs next to the game, and for one that can't, the console asks on the TV.
 Same title already running → sent anyway (the payload leaves it running, see below). Tested live on two PS4 Pros
 (FW 11.00 + 12.00).
 
@@ -19,6 +20,10 @@ clears the title on rest, so HA can't tell, but the payload can. When the picked
 closes it: it launches the same title, which answers "already running" and makes the console resume the existing
 process (what pressing its tile does), so no progress is lost. Tested on a PS4 Pro (FW 12.00) after an HA rest + wake +
 login: two games resumed in their own processes, one of them at the same spot.
+
+Close application closes the title in front, game or app (an app is never the console's big app, so the big-app
+close leaves it open). At the home screen it closes the game suspended behind it, as before. System titles (NPXS) are
+never closed: the Internet Browser runs inside the home screen's app, so closing it would close the home screen.
 """
 from __future__ import annotations
 
@@ -33,7 +38,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 
 from . import _send_bin_bytes
-from .const import DOMAIN
+from .const import DOMAIN, SENSOR_TITLE_ID
 from .rest import async_payload_preflight
 
 _LOGGER = logging.getLogger(__name__)
@@ -48,29 +53,35 @@ PAYLOADER_RETRY = 0.5
 
 _MARKER = b"PS4GH_TITLE_ID_\x00"
 _TITLE_ID = re.compile(r"[A-Z]{4}\d{5}")
+_SYSTEM_PREFIX = "NPXS"
 
 
-def build_payload(elf: bytes, title_id: str | None, close_first: bool, resume_only: bool = False) -> bytes:
+def build_payload(
+    elf: bytes, title_id: str | None, close_first: bool, resume_only: bool = False, close_only: bool = False,
+) -> bytes:
     """The launch ELF with its marker replaced: title ID (or none = close / resume only) + the flag."""
     if title_id is not None and not _TITLE_ID.fullmatch(title_id):
         raise HomeAssistantError(f"Not a PS4 title ID: {title_id}")
     if resume_only and title_id is not None:
         raise HomeAssistantError("Resume takes no title ID: it brings back whichever game is suspended")
+    if close_only and (title_id is None or title_id.startswith(_SYSTEM_PREFIX)):
+        raise HomeAssistantError("Close takes the title ID of a game or app")
     if elf.count(_MARKER) != 1:
         raise HomeAssistantError("The bundled launch payload is damaged (marker not found once)")
-    flag = b"R" if resume_only else b"K" if close_first else b"\0"
+    flag = b"R" if resume_only else b"C" if close_only else b"K" if close_first else b"\0"
     slot = (title_id or "").encode().ljust(10, b"\0") + flag
     return elf.replace(_MARKER, slot.ljust(len(_MARKER), b"\0"))
 
 
 async def _async_send(
     hass: HomeAssistant, entry: ConfigEntry, title_id: str | None, what: str, *,
-    resume_only: bool = False, after_wake: bool = False,
+    resume_only: bool = False, after_wake: bool = False, close_first: bool = True, close_only: bool = False,
 ) -> None:
     data = hass.data[DOMAIN][entry.entry_id]
     firmware = await async_payload_preflight(hass, entry, what, after_wake=after_wake)
     elf = await hass.async_add_executor_job(LAUNCH_PAYLOAD.read_bytes)
-    payload = build_payload(elf, title_id, close_first=not resume_only, resume_only=resume_only)
+    payload = build_payload(elf, title_id, close_first=close_first and not resume_only, resume_only=resume_only,
+                            close_only=close_only)
     _LOGGER.info("%s: sending %s to %s (firmware %s)", what, title_id or ("resume" if resume_only else "close"),
                  data["host"], firmware)
     deadline = time.monotonic() + (PAYLOADER_WAIT if after_wake else 0)
@@ -88,15 +99,18 @@ async def _async_send(
         _LOGGER.debug("%s: BinLoader refused %d times after the wake, then took it", what, refused)
 
 
-async def async_launch_title(hass: HomeAssistant, entry: ConfigEntry, title_id: str, *, after_wake: bool = False) -> None:
-    """Start a game on this entry's PS4, closing the running one first, or bring it back if it's the suspended one.
-    `after_wake`: HA just woke the console and logged in. Raises HomeAssistantError (shown to the user)."""
+async def async_launch_title(
+    hass: HomeAssistant, entry: ConfigEntry, title_id: str, *, after_wake: bool = False, close_first: bool = True,
+) -> None:
+    """Start a title on this entry's PS4, closing the running game first (`close_first`, off for an app), or bring
+    it back if it's the suspended one. `after_wake`: HA just woke the console and logged in. Raises
+    HomeAssistantError (shown to the user)."""
     tid = title_id.strip().upper()
     if not _TITLE_ID.fullmatch(tid):
         raise HomeAssistantError(f"Not a PS4 title ID: {title_id}")
     # no "already running" shortcut. A title from DDP (after an HA restart) can be a game in the background,
     # and the payload never closes the picked game: in front it's a no-op (0x8094000c), in the background it resumes.
-    await _async_send(hass, entry, tid, "Launch", after_wake=after_wake)
+    await _async_send(hass, entry, tid, "Launch", after_wake=after_wake, close_first=close_first)
 
 
 async def async_resume_suspended(hass: HomeAssistant, entry: ConfigEntry) -> None:
@@ -105,6 +119,23 @@ async def async_resume_suspended(hass: HomeAssistant, entry: ConfigEntry) -> Non
     await _async_send(hass, entry, None, "Resume game", resume_only=True, after_wake=True)
 
 
-async def async_close_game(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Close the running game (back to the home screen). Unsaved progress is lost, like Close Application."""
-    await _async_send(hass, entry, None, "Close game")
+async def async_close_title(hass: HomeAssistant, entry: ConfigEntry, title_id: str) -> None:
+    """Close one game or app, in front or in the background. Unsaved progress is lost, like Close Application. Not
+    running → the payload logs it and does nothing. Raises HomeAssistantError."""
+    tid = title_id.strip().upper()
+    if not _TITLE_ID.fullmatch(tid):
+        raise HomeAssistantError(f"Not a PS4 title ID: {title_id}")
+    if tid.startswith(_SYSTEM_PREFIX):
+        raise HomeAssistantError(f"{tid} is a system app: HA can't close it (the Internet Browser runs inside the "
+                                 "home screen). Close it on the PS4")
+    await _async_send(hass, entry, tid, "Close", close_only=True)
+
+
+async def async_close_front(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """The Close application button: the game or app in front; at the home screen the game suspended behind it.
+    Raises HomeAssistantError."""
+    tid = (hass.data[DOMAIN][entry.entry_id]["coordinator"].data or {}).get(SENSOR_TITLE_ID)
+    if tid:
+        await async_close_title(hass, entry, tid)
+    else:
+        await _async_send(hass, entry, None, "Close application")

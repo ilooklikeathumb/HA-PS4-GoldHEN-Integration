@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 COMP = ROOT / "custom_components/ps4_goldhen"
 PKG = "ps4_game_session_test_pkg"
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from test_klog_power_state import KlogStateMachine, WAKE  # noqa: E402
+from test_klog_power_state import GAME_FOCUS, REST_FROM_GAME, KlogStateMachine, WAKE  # noqa: E402
 
 _SAVED: dict = {}
 SENT: list = []
@@ -226,6 +226,16 @@ class CaptureReplayTests(unittest.TestCase):
         self.assertEqual((payload["started"], payload["ended"]), (at("00:23:32"), at("00:24:16")))
 
 
+class RestOrderTests(unittest.TestCase):
+    def test_rest_from_a_game_is_one_left(self):
+        """The console's order (power-mode line right after MAIN_ON_STANDBY): one left, no background rest after."""
+        lines = [("00:10:00", line) for line in WAKE + [GAME_FOCUS]]
+        lines += [(f"00:20:{i:02d}", line) for i, line in enumerate(REST_FROM_GAME)]
+        _, _, events = replay(lines)
+        self.assertEqual(events, [("00:10:00", "started", "CUSA90007", None, None),
+                                  ("00:20:02", "left", "CUSA90007", "rest", False)])
+
+
 class TrackerRuleTests(unittest.TestCase):
     T0 = datetime(2026, 10, 16, 20, 0, tzinfo=timezone.utc)
 
@@ -241,6 +251,21 @@ class TrackerRuleTests(unittest.TestCase):
         self.assertIsNone(t.segment)
         out = t.update(self.data(title_id=GAME_D), self.T0 + timedelta(minutes=6), NAMES.get)
         self.assertEqual([k for k, _ in out], ["started"])
+
+    def test_not_responding_mid_game_then_back(self):  # frozen: play time stops; a false alarm starts it again
+        t = gs.GameSessionTracker()
+        t.update(self.data(title_id=GAME_D), self.T0, NAMES.get)
+        out = t.update(self.data(title_id=GAME_D, not_responding=True), self.T0 + timedelta(minutes=6), NAMES.get)
+        self.assertEqual([(k, p["reason"], p["background"]) for k, p in out], [("left", "not_responding", False)])
+        self.assertEqual(out[0][1]["ended"], self.T0 + timedelta(minutes=6))
+        self.assertIsNone(t.segment)
+        out = t.update(self.data(title_id=GAME_D), self.T0 + timedelta(minutes=7), NAMES.get)
+        self.assertEqual([k for k, _ in out], ["started"])
+
+    def test_not_responding_with_a_suspended_game_says_nothing(self):
+        t = gs.GameSessionTracker()
+        t.update(self.data(suspended_title_id=GAME_D), self.T0, NAMES.get)
+        self.assertEqual(t.update(self.data(suspended_title_id=GAME_D, not_responding=True), self.T0, NAMES.get), [])
 
     def test_switch_straight_to_another_game(self):
         t = gs.GameSessionTracker()

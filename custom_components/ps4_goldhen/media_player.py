@@ -1,8 +1,9 @@
-"""PS4 GoldHEN media player: power state, running game + cover, wake and rest, game list + launch.
+"""PS4 GoldHEN media player: power state, running game + cover, wake and rest, title list + launch.
 
 HA's standard entity for a game console (core ps4, playstation_network and xbox use it too). State comes from klog
 lines: off (rest mode or fully off) / idle (home screen) / playing (a game). HA deprecated STANDBY, so rest
-reads `off`; the `power_state` attribute (on / rest / off) tells rest from fully off.
+reads `off`; the `power_state` attribute (on / rest / off) tells rest from fully off. A console that's on but stopped
+answering (klog silent, no DDP reply: frozen) reads unknown, with the `not_responding` attribute true.
 Turn on sends Sony's DDP WAKEUP with the Remote Play regist key from the options, or presses the optional wake entity
 (e.g. a Bluetooth wake button) when the console is fully off or no key is set. Turn off puts the console into rest
 mode with the bundled rest payload (`rest.py`).
@@ -13,9 +14,11 @@ pairing's RP-Key is saved, turn on then logs the paired user in with a short Rem
 but klog shows the choose-user screen. Skipped when DDP says the console is on with someone logged in, and after a
 wake entity press (fully off: GoldHEN isn't running until someone loads it again).
 
-The console's games (from its app.db, `db.game_list`) are the source list and the media browser (a cover grid
-in HA's Media panel: "Recently played" + "All games"). Picking one starts it with the bundled launch payload
-(`launch.py`), closing the running game first.
+The console's games and installed apps (from its app.db, `db.title_list`; built-in titles such as the Internet
+Browser stay out, and `play_media` refuses them) are the source list and the media browser (a cover grid in HA's Media panel: "Recently played" +
+"All games" + "Apps", and "Folders" = the logged-in user's home-screen folders, `db.folder_layout`). Picking one
+starts it with the bundled launch payload (`launch.py`): a game closes the running game first, an app never does (the
+console asks on the TV if it has to).
 
 After turn on logged the user in, the game suspended by rest comes back (`launch.async_resume_suspended`),
 as it does after a controller wake. Picking a game while the console rests (or sits on the choose-user screen) wakes
@@ -27,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import Any
 
 from homeassistant.components.media_player import (
     BrowseError,
@@ -43,11 +47,10 @@ from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from . import _read_or_fetch_cover
+from . import _read_cached_cover, _read_or_fetch_cover
 from . import ftp_session
 from .const import (
     DOMAIN,
-    CONF_PS4_HOST,
     CONF_REGIST_KEY,
     CONF_RP_KEY,
     CONF_WAKE_ENTITY,
@@ -57,9 +60,9 @@ from .const import (
     POWER_REST,
     POWER_OFF,
 )
-from .db import game_list
+from .db import folder_layout, is_app, is_built_in, title_list
 from .ddp import async_search, async_wakeup
-from .entity import ps4_device_info
+from .entity import media_player_unique_id, ps4_device_info
 from .launch import async_launch_title, async_resume_suspended
 from .rest import async_enter_rest
 from .rp_session import RpSessionError, async_login_after_wake
@@ -70,6 +73,12 @@ _PRESS_DOMAINS = ("button", "input_button")  # other wake entities (scripts) are
 
 _BROWSE_RECENT = "recent"
 _BROWSE_ALL = "all"
+_BROWSE_APPS = "apps"
+_BROWSE_FOLDERS = "folders"
+_BROWSE_FOLDER = "folder/"  # + the console folder's ID in app.db
+_BROWSE_TITLES = {
+    _BROWSE_RECENT: "Recently played", _BROWSE_ALL: "All games", _BROWSE_APPS: "Apps", _BROWSE_FOLDERS: "Folders",
+}
 _RECENT_COUNT = 12
 
 # RpSessionError reason → why the console stays on the choose-user screen
@@ -106,35 +115,61 @@ class PS4MediaPlayer(CoordinatorEntity, MediaPlayerEntity):
     def __init__(self, hass: HomeAssistant, coordinator, entry: ConfigEntry) -> None:
         super().__init__(coordinator)
         self._entry = entry
-        self._attr_unique_id = f"{DOMAIN}_{entry.data[CONF_PS4_HOST]}_media_player"
+        self._attr_unique_id = media_player_unique_id(entry)
         self._attr_device_info = ps4_device_info(entry)
         self._entry_data = hass.data[DOMAIN][entry.entry_id]  # updated in place (game_map refreshes)
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        self._entry_data["media_player_entity"] = self  # the panel's Content tab: cover URLs (games.py)
+
+    async def async_will_remove_from_hass(self) -> None:
+        if self._entry_data.get("media_player_entity") is self:
+            del self._entry_data["media_player_entity"]
+        await super().async_will_remove_from_hass()
+
+    def cover_url(self, tid: str) -> str:
+        """A title's cover as the media browser shows it: HA's media player proxy (this entity's access token), served
+        from the console's cached icon0.png."""
+        return self.get_browse_image_url(self._media_type(tid), tid)
 
     def _power(self) -> str | None:
         return (self.coordinator.data or {}).get("power_state")
 
+    def _not_responding(self) -> bool:
+        return bool((self.coordinator.data or {}).get("not_responding"))
+
     def _tid(self) -> str | None:
-        """Title ID of the running game; None on the home screen, in rest or off."""
-        if self._power() in (POWER_REST, POWER_OFF):
+        """Title ID of the running game; None on the home screen, in rest, off or not responding."""
+        if self._power() in (POWER_REST, POWER_OFF) or self._not_responding():
             return None
         tid = (self.coordinator.data or {}).get(SENSOR_TITLE_ID)
         return tid.strip().upper() if tid else None
 
-    def _cdn_cover(self, tid: str) -> str | None:
-        url = self._entry_data.get("game_map", {}).get(tid, {}).get("cdn_cover")
-        return url if url and url.startswith("http") else None
+    def _titles(self) -> list[tuple[str, str]]:
+        """Games and installed apps: [(title ID, name)] last played first."""
+        return title_list(self._entry_data.get("game_map", {}))
 
-    def _games(self) -> list[tuple[str, str]]:
-        """[(title ID, name)] last played first."""
-        return game_list(self._entry_data.get("game_map", {}))
+    def _is_app(self, tid: str) -> bool:
+        return is_app(self._entry_data.get("game_map", {}), tid)
+
+    def _media_type(self, tid: str) -> MediaType:
+        return MediaType.APP if self._is_app(tid) else MediaType.GAME
 
     async def _async_cover(self, tid: str) -> tuple[bytes | None, str | None]:
-        """The console's icon0.png for a title: disk cache, else FTP (one fetch at a time)."""
+        """The console's icon0.png for a title: HA's disk cache, else FTP (one fetch at a time). A cover grid asks for
+        every title at once, so a cached cover skips the FTP lock, and a console in rest mode or off gets no FTP."""
+        console = self._entry.entry_id
+        cached = await self.hass.async_add_executor_job(_read_cached_cover, console, tid)
+        if cached is not None:
+            return cached, "image/png"
+        if self._power() in (POWER_REST, POWER_OFF):
+            return None, None
         data = self._entry_data
         cover_path = data.get("game_map", {}).get(tid, {}).get("cover") or f"/user/appmeta/{tid}/icon0.png"
         try:  # under the console's FTP lock (one HA FTP session per console)
             content = await ftp_session.run(
-                self.hass, data, _read_or_fetch_cover, data["host"], int(data["ftp_port"]), tid, cover_path
+                self.hass, data, _read_or_fetch_cover, data["host"], int(data["ftp_port"]), console, tid, cover_path
             )
         except Exception as err:  # noqa: BLE001 — no cover is a normal outcome (e.g. FTP off)
             _LOGGER.debug("Cover for %s unavailable: %s", tid, err)
@@ -146,6 +181,8 @@ class PS4MediaPlayer(CoordinatorEntity, MediaPlayerEntity):
         power = self._power()
         if power in (POWER_OFF, POWER_REST):
             return MediaPlayerState.OFF
+        if self._not_responding():
+            return None  # on, but klog silent and no DDP reply (frozen): the Status sensor says Not responding
         if self._tid():
             return MediaPlayerState.PLAYING
         if power == POWER_ON:
@@ -154,7 +191,8 @@ class PS4MediaPlayer(CoordinatorEntity, MediaPlayerEntity):
 
     @property
     def extra_state_attributes(self) -> dict[str, str | None]:
-        return {"power_state": self._power()}  # rest and fully off both read `off`
+        # rest and fully off both read `off`; not responding reads unknown
+        return {"power_state": self._power(), "not_responding": self._not_responding()}
 
     @property
     def supported_features(self) -> MediaPlayerEntityFeature:
@@ -162,7 +200,7 @@ class PS4MediaPlayer(CoordinatorEntity, MediaPlayerEntity):
         options = self._entry.options
         if options.get(CONF_REGIST_KEY) or options.get(CONF_WAKE_ENTITY):
             features |= MediaPlayerEntityFeature.TURN_ON
-        if self._games():  # game list + launch, once the console's app.db has been read
+        if self._titles():  # title list + launch, once the console's app.db has been read
             features |= (
                 MediaPlayerEntityFeature.SELECT_SOURCE
                 | MediaPlayerEntityFeature.BROWSE_MEDIA
@@ -172,16 +210,17 @@ class PS4MediaPlayer(CoordinatorEntity, MediaPlayerEntity):
 
     @property
     def source_list(self) -> list[str] | None:
-        return [name for _, name in self._games()] or None
+        return [name for _, name in self._titles()] or None
 
     @property
     def source(self) -> str | None:
         tid = self._tid()
-        return next((name for game_tid, name in self._games() if game_tid == tid), None) if tid else None
+        return next((name for title_tid, name in self._titles() if title_tid == tid), None) if tid else None
 
     @property
     def media_content_type(self) -> MediaType | None:
-        return MediaType.GAME if self._tid() else None
+        tid = self._tid()
+        return self._media_type(tid) if tid else None
 
     @property
     def media_content_id(self) -> str | None:
@@ -196,97 +235,140 @@ class PS4MediaPlayer(CoordinatorEntity, MediaPlayerEntity):
         return name.strip() if name and name.strip() else tid
 
     @property
-    def media_image_url(self) -> str | None:
-        tid = self._tid()
-        return self._cdn_cover(tid) if tid else None
-
-    @property
     def media_image_hash(self) -> str | None:
-        # no CDN cover → the console's own icon0.png, served by async_get_media_image
-        tid = self._tid()
-        if tid and not self._cdn_cover(tid):
-            return tid
-        return super().media_image_hash
+        # the console's own icon0.png, served by async_get_media_image
+        return self._tid()
 
     async def async_get_media_image(self) -> tuple[bytes | None, str | None]:
         tid = self._tid()
         if tid is None:
             return None, None
-        if self._cdn_cover(tid):
-            return await super().async_get_media_image()
         return await self._async_cover(tid)
 
     async def async_select_source(self, source: str) -> None:
-        """Start the game picked from the source list."""
-        tid = next((game_tid for game_tid, name in self._games() if name == source), None)
+        """Start the game or app picked from the source list."""
+        tid = next((title_tid for title_tid, name in self._titles() if name == source), None)
         if tid is None:
-            raise HomeAssistantError(f"No game named {source!r} on this PS4")
+            raise HomeAssistantError(f"No game or app named {source!r} on this PS4")
         await self._async_launch(tid)
 
     async def async_play_media(self, media_type: MediaType | str, media_id: str, **kwargs) -> None:
-        """Start a game by title ID: the media browser, or `media_player.play_media` with type `game`."""
-        if media_type != MediaType.GAME:
-            raise HomeAssistantError(f"Only games can be played on the PS4 (got {media_type})")
+        """Start a title by title ID: the media browser, or `media_player.play_media` with type `game` or `app`
+        (the console's app.db says which it is)."""
+        if media_type not in (MediaType.GAME, MediaType.APP):
+            raise HomeAssistantError(f"Only games and apps can be played on the PS4 (got {media_type})")
+        if is_built_in(self._entry_data.get("game_map", {}), media_id.strip().upper()):
+            raise HomeAssistantError(f"{media_id} is built into the PS4 (like the Internet Browser): HA doesn't open it")
         await self._async_launch(media_id)
 
     async def _async_launch(self, tid: str) -> None:
-        """In rest (or on the choose-user screen) wake + log in first; the payload resumes the picked game
-        if it's the suspended one."""
+        """In rest (or on the choose-user screen) wake + log in first; the payload resumes the picked title
+        if it's the suspended one. An app never closes the running game."""
+        close_first = not self._is_app(tid.strip().upper())
         power = self._power()
         if power == POWER_OFF:
             raise HomeAssistantError(
-                "The PS4 is fully off: games start from HA in rest mode or when on (GoldHEN has to be loaded again)"
+                "The PS4 is fully off: games and apps start from HA in rest mode or when on (GoldHEN has to be loaded "
+                "again)"
             )
         if power != POWER_REST and not self._choose_user_screen():
-            await async_launch_title(self.hass, self._entry, tid)
+            await async_launch_title(self.hass, self._entry, tid, close_first=close_first)
             return
         options = self._entry.options
         if not options.get(CONF_REGIST_KEY) or not options.get(CONF_RP_KEY):
             raise HomeAssistantError(
-                "Starting a game from rest needs HA's pairing with this PS4 (PS4 GoldHEN options: Configure → Pair with the PS4)"
+                "Starting a game or app from rest needs HA's pairing with this PS4 (PS4 GoldHEN options: Configure → "
+                "Pair with the PS4)"
             )
         await self._async_wake()
-        await async_launch_title(self.hass, self._entry, tid, after_wake=True)
+        await async_launch_title(self.hass, self._entry, tid, after_wake=True, close_first=close_first)
 
     async def async_browse_media(
         self, media_content_type: MediaType | str | None = None, media_content_id: str | None = None
     ) -> BrowseMedia:
-        """The console's games as a cover grid: "Recently played" + "All games"."""
-        games = self._games()
+        """The console's games and apps as a cover grid: "Recently played" + "All games" + "Apps", plus "Folders" when
+        the logged-in user has home-screen folders."""
+        titles = self._titles()
         if media_content_id in (None, ""):
-            folders = [self._folder(_BROWSE_RECENT, "Recently played"), self._folder(_BROWSE_ALL, "All games")]
+            layout = await self._async_layout()
+            folders = [
+                self._folder(content_id) for content_id in _BROWSE_TITLES
+                if content_id != _BROWSE_FOLDERS or layout["folders"]
+            ]
             return BrowseMedia(
                 media_class=MediaClass.DIRECTORY, media_content_id="", media_content_type="",
-                title="Games", can_play=False, can_expand=True,
+                title="Games and apps", can_play=False, can_expand=True,
                 children=folders, children_media_class=MediaClass.DIRECTORY,
             )
+        if media_content_id == _BROWSE_FOLDERS:  # the console's folders, then the titles outside a folder
+            layout = await self._async_layout()
+            names = dict(titles)
+            folder = self._folder(media_content_id)
+            folder.children = [self._console_folder(console_folder) for console_folder in layout["folders"]] + [
+                self._tile(tid, names[tid]) for tid in layout["loose"] if tid in names
+            ]
+            return folder
+        if media_content_id.startswith(_BROWSE_FOLDER):
+            layout = await self._async_layout()
+            folder_id = media_content_id.removeprefix(_BROWSE_FOLDER)
+            console_folder = next((f for f in layout["folders"] if f["id"] == folder_id), None)
+            if console_folder is None:  # e.g. another user logged in since
+                raise BrowseError(f"Unknown PS4 folder: {media_content_id}")
+            names = dict(titles)
+            folder = self._console_folder(console_folder)
+            folder.children = [self._tile(tid, names[tid]) for tid in console_folder["titles"] if tid in names]
+            return folder
         if media_content_id == _BROWSE_RECENT:
-            picked = games[:_RECENT_COUNT]
-        elif media_content_id == _BROWSE_ALL:
-            picked = sorted(games, key=lambda game: game[1].casefold())
+            picked = titles[:_RECENT_COUNT]
+        elif media_content_id in (_BROWSE_ALL, _BROWSE_APPS):
+            apps = media_content_id == _BROWSE_APPS
+            picked = sorted(
+                (title for title in titles if self._is_app(title[0]) == apps), key=lambda title: title[1].casefold(),
+            )
         else:
             raise BrowseError(f"Unknown PS4 folder: {media_content_id}")
-        folder = self._folder(media_content_id, "Recently played" if media_content_id == _BROWSE_RECENT else "All games")
-        folder.children = [
-            BrowseMedia(
-                media_class=MediaClass.GAME, media_content_id=tid, media_content_type=MediaType.GAME, title=name,
-                can_play=True, can_expand=False, thumbnail=self.get_browse_image_url(MediaType.GAME, tid),
-            )
-            for tid, name in picked
-        ]
+        folder = self._folder(media_content_id)
+        folder.children = [self._tile(tid, name) for tid, name in picked]
         return folder
 
+    def _tile(self, tid: str, name: str) -> BrowseMedia:
+        media_type = self._media_type(tid)
+        return BrowseMedia(
+            media_class=MediaClass.APP if media_type == MediaType.APP else MediaClass.GAME,
+            media_content_id=tid, media_content_type=media_type, title=name,
+            can_play=True, can_expand=False, thumbnail=self.get_browse_image_url(media_type, tid),
+        )
+
     @staticmethod
-    def _folder(content_id: str, title: str) -> BrowseMedia:
+    def _folder(content_id: str) -> BrowseMedia:
         return BrowseMedia(
             media_class=MediaClass.DIRECTORY, media_content_id=content_id, media_content_type="",
-            title=title, can_play=False, can_expand=True, children_media_class=MediaClass.GAME,
+            title=_BROWSE_TITLES[content_id], can_play=False, can_expand=True,
+            children_media_class=MediaClass.APP if content_id == _BROWSE_APPS else MediaClass.GAME,
         )
+
+    def _console_folder(self, console_folder: dict[str, Any]) -> BrowseMedia:
+        """A home-screen folder; its tile shows the cover of the title its app.db row names (`db.folder_layout`)."""
+        cover, titles = console_folder["cover"], console_folder["titles"]
+        return BrowseMedia(
+            media_class=MediaClass.DIRECTORY, media_content_id=_BROWSE_FOLDER + console_folder["id"],
+            media_content_type="", title=console_folder["name"], can_play=False, can_expand=True,
+            children_media_class=MediaClass.APP if all(map(self._is_app, titles)) else MediaClass.GAME,
+            thumbnail=self.get_browse_image_url(self._media_type(cover), cover),
+        )
+
+    async def _async_layout(self) -> dict[str, list]:
+        """The home-screen folders of the user klog last saw log in (before that: whoever played last)."""
+        user = (self.coordinator.data or {}).get("login_user_id")
+        layout = await self.hass.async_add_executor_job(
+            folder_layout, self._entry_data["host"], int(user, 16) if user else None
+        )
+        return layout or {"folders": [], "loose": []}
 
     async def async_get_browse_image(
         self, media_content_type: str, media_content_id: str, media_image_id: str | None = None
     ) -> tuple[bytes | None, str | None]:
-        """A game tile's cover: the console's icon0.png (only titles in this console's app.db)."""
+        """A tile's cover: the console's icon0.png (only titles in this console's app.db)."""
         tid = media_content_id.strip().upper()
         if tid not in self._entry_data.get("game_map", {}):
             return None, None

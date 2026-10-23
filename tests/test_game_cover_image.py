@@ -90,15 +90,15 @@ _module("homeassistant.util")
 _module("homeassistant.util.dt", utcnow=lambda: datetime.now(timezone.utc))
 
 FTP_FETCHES = []
-DISK_CACHE = {}  # /config/ps4/covers: the real _read_or_fetch_cover reads it first, under the FTP lock
+DISK_CACHE = {}  # /config/ps4/covers/<console>: the real _read_or_fetch_cover reads it first, under the FTP lock
 
 
-def fake_read_or_fetch_cover(host, ftp_port, tid, cover_path):
-    if tid in DISK_CACHE:
-        return DISK_CACHE[tid]
-    FTP_FETCHES.append((host, ftp_port, tid, cover_path))
-    DISK_CACHE[tid] = b"png:" + tid.encode()
-    return DISK_CACHE[tid]
+def fake_read_or_fetch_cover(host, ftp_port, console, tid, cover_path):
+    if (console, tid) in DISK_CACHE:
+        return DISK_CACHE[(console, tid)]
+    FTP_FETCHES.append((host, ftp_port, console, tid, cover_path))
+    DISK_CACHE[(console, tid)] = b"png:" + tid.encode()
+    return DISK_CACHE[(console, tid)]
 
 
 pkg = _module(PKG, _read_or_fetch_cover=fake_read_or_fetch_cover)
@@ -143,27 +143,28 @@ class GameCoverTests(unittest.TestCase):
         self.assertIsNone(e.state)  # HA shows "Unknown"
         self.assertIsNone(run(e.async_image()))
 
-    def test_game_with_cdn_cover(self):
-        e, *_ = make({"title_id": "cusa90003"}, {"CUSA90003": {"cdn_cover": "https://cdn.example/game-c.png"}})
-        self.assertEqual(e._attr_image_url, "https://cdn.example/game-c.png")
+    def test_game_uses_console_icon(self):
+        e, *_ = make({"title_id": "cusa90003"}, {"CUSA90003": {"cover": "/user/appmeta/CUSA90003/icon0.png"}})
+        self.assertIsNone(e._attr_image_url)
         self.assertTrue(e.entity_picture.startswith("/api/image_proxy/"))
         self.assertIsNotNone(e.state)
-        self.assertEqual(run(e.async_image()), b"cdn:https://cdn.example/game-c.png")
-        self.assertEqual(FTP_FETCHES, [])
-
-    def test_game_without_cdn_uses_console_icon(self):
-        e, *_ = make({"title_id": "CUSA90003"}, {"CUSA90003": {"cover": "/user/appmeta/CUSA90003/icon0.png"}})
-        self.assertIsNone(e._attr_image_url)
         self.assertEqual(run(e.async_image()), b"png:CUSA90003")
         self.assertEqual(e._attr_content_type, "image/png")
-        self.assertEqual(FTP_FETCHES, [("192.0.2.1", 2121, "CUSA90003", "/user/appmeta/CUSA90003/icon0.png")])
+        self.assertEqual(FTP_FETCHES, [("192.0.2.1", 2121, "E1", "CUSA90003", "/user/appmeta/CUSA90003/icon0.png")])
         run(e.async_image())  # second view = in-memory cache
         self.assertEqual(len(FTP_FETCHES), 1)
+        self.assertEqual(e.cdn_fetches, 0, "never a URL fetch")
+
+    def test_cache_is_per_console(self):  # the same title can have a different icon on another console
+        DISK_CACHE[("OTHER", "CUSA90003")] = b"other console's icon"
+        e, *_ = make({"title_id": "CUSA90003"})
+        self.assertEqual(run(e.async_image()), b"png:CUSA90003")
+        self.assertEqual([f[2:4] for f in FTP_FETCHES], [("E1", "CUSA90003")])
 
     def test_default_cover_path_when_app_db_lacks_title(self):
         e, *_ = make({"title_id": "CUSA00001"})
         run(e.async_image())
-        self.assertEqual(FTP_FETCHES[0][3], "/user/appmeta/CUSA00001/icon0.png")
+        self.assertEqual(FTP_FETCHES[0][4], "/user/appmeta/CUSA00001/icon0.png")
 
     def test_rest_and_off_hide_the_cover(self):
         for power in (const.POWER_REST, const.POWER_OFF):
@@ -200,13 +201,15 @@ class GameCoverTests(unittest.TestCase):
         self.assertIsNotNone(e._cached_image)
         self.assertEqual(e._attr_image_last_updated, stamp)
 
-    def test_cdn_url_arriving_later_switches_source(self):
-        # app.db refresh lands after the game started
+    def test_app_db_refresh_keeps_the_cover(self):  # an app.db pull for the same game neither clears nor restamps
         e, coordinator, entry_data, _ = make({"title_id": "CUSA90003"})
-        self.assertIsNone(e._attr_image_url)
-        entry_data["game_map"] = {"CUSA90003": {"cdn_cover": "https://cdn.example/game-c.png"}}
+        run(e.async_image())
+        stamp = e._attr_image_last_updated
+        entry_data["game_map"] = {"CUSA90003": {"name": "Game C", "cover": "/user/appmeta/CUSA90003/icon0.png"}}
         e._handle_coordinator_update()
-        self.assertEqual(e._attr_image_url, "https://cdn.example/game-c.png")
+        self.assertIsNone(e._attr_image_url)
+        self.assertIsNotNone(e._cached_image)
+        self.assertEqual(e._attr_image_last_updated, stamp)
 
     def test_fetch_failure_is_no_image(self):
         e, *_ = make({"title_id": "CUSA90003"})

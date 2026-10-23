@@ -135,6 +135,13 @@ class CurrentGameStateTests(unittest.TestCase):
                 self.assertEqual(e.native_value, text)
                 self.assertEqual(e.extra_state_attributes["state_classification"], cls)
 
+    def test_not_responding_text(self):  # frozen mid-game: the game's name would say it's still playing
+        e, _ = make({"power_state": "on", "not_responding": True, "title_id": "CUSA90003", "game_name": "Game C"})
+        self.assertEqual(e.native_value, "Not responding")
+        self.assertEqual(e.extra_state_attributes["state_classification"], "not_responding")
+        e, _ = make({"power_state": "rest", "not_responding": True})  # rest / off win
+        self.assertEqual(e.native_value, "Rest Mode")
+
     def test_running_console_unchanged(self):
         e, _ = make({"power_state": "on"})
         self.assertEqual(e.native_value, const.HOME_SCREEN)
@@ -200,6 +207,10 @@ class StatusSensorTests(unittest.TestCase):
             ({"power_state": "rest", **game}, "rest"),
             ({"power_state": "off", **game}, "off"),
             ({"power_state": None}, None),  # unknown, like the media player
+            ({"power_state": "on", "not_responding": True, **game}, "not_responding"),
+            ({"power_state": "on", "not_responding": True}, "not_responding"),
+            ({"power_state": "rest", "not_responding": True}, "rest"),
+            ({"power_state": "on", "not_responding": False, **game}, "playing"),
             ({}, None),
         ):
             with self.subTest(data=data):
@@ -207,7 +218,7 @@ class StatusSensorTests(unittest.TestCase):
 
     def test_options_cover_every_state(self):
         e, _ = make_status({})
-        self.assertEqual(e._attr_options, ["playing", "home_screen", "rest", "off"])
+        self.assertEqual(e._attr_options, ["playing", "home_screen", "rest", "off", "not_responding"])
 
     def test_translations_name_every_state(self):
         import json
@@ -216,10 +227,11 @@ class StatusSensorTests(unittest.TestCase):
                 status = json.loads((COMP / path).read_text())["entity"]["sensor"]["status"]
                 self.assertEqual(
                     status["state"],
-                    {"playing": "Playing", "home_screen": "Home screen", "rest": "Rest mode", "off": "Off"},
+                    {"playing": "Playing", "home_screen": "Home screen", "rest": "Rest mode", "off": "Off",
+                     "not_responding": "Not responding"},
                 )
         icons = json.loads((COMP / "icons.json").read_text())["entity"]["sensor"]["status"]["state"]
-        self.assertEqual(set(icons), {"playing", "home_screen", "rest", "off"})
+        self.assertEqual(set(icons), {"playing", "home_screen", "rest", "off", "not_responding"})
 
     def restore(self, state):
         e, machine = make_status({})

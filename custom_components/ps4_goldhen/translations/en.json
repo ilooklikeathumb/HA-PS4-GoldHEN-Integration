@@ -126,7 +126,8 @@
           "playing": "Playing",
           "home_screen": "Home screen",
           "rest": "Rest mode",
-          "off": "Off"
+          "off": "Off",
+          "not_responding": "Not responding"
         }
       },
       "play_time_today": {
@@ -149,7 +150,8 @@
           "up_to_date": "Up to date",
           "limit_reached": "Limit reached",
           "game_open": "Skipped an open game",
-          "failed": "Failed"
+          "failed": "Failed",
+          "stopped": "Stopped"
         }
       },
       "last_save_backup": {

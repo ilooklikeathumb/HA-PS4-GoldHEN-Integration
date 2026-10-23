@@ -24,12 +24,13 @@ from homeassistant.components import panel_custom, websocket_api
 from homeassistant.components.frontend import StaticPathConfig
 from homeassistant.components.http import HomeAssistantView
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.core import HomeAssistant, ServiceCall, callback
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
-from .payload_target import payload_target
+from .payload_target import payload_path, payload_target
 from .const import (
     DOMAIN,
     PLATFORMS,
@@ -75,13 +76,15 @@ from . import live_sensors
 from . import screenshots
 from . import screenshot_entities  # noqa: F401  loaded here, the platforms import it in setup
 from . import game_session
+from . import games
 from . import play_time
 from . import save_backup
 from . import save_backup_entities  # noqa: F401  loaded here, the platforms import it in setup
-from .entity import device_name
+from .entity import device_name, media_player_unique_id
 from .ddp import async_search
 from . import db as ps4_db
 from . import ftp_session
+from .ftp_listing import list_directory
 from .ftp_telemetry import async_fetch_telemetry
 
 _LOGGER = logging.getLogger(__name__)
@@ -94,7 +97,14 @@ _FTP_TELEMETRY_ENABLED = False
 _PS4STATE_JSON_PATH = "/data/GoldHEN/ps4_state.json"
 _FORCE_DB_COOLDOWN  = 300  # s between on-demand app.db pulls for the same unknown title
 _DB_POWER_WAIT      = 30   # s the first app.db pull waits for the power state
+# after a wake the app.db pull (+ covers) waits until the console has been on, someone logged in, this long: the
+# first minute after a wake is the console's busiest, and turn on may resume a game with a payload then
+_WAKE_SETTLE        = 90
+_WAKE_CHECK         = 5    # s between checks while it settles
+_WAKE_PULL_COOLDOWN = 600  # s: a wake this soon after the last pull waits for the hourly one
+_COVERS_PER_SESSION = 25   # missing covers fetched per FTP session; the lock is free in between
 _SVC_SEND_PAYLOAD   = "send_payload"
+_SVC_CLOSE_TITLE    = "close_title"
 
 _PANEL_URL_PATH       = "ps4_goldhen"
 _PANEL_SIDEBAR_TITLE  = "PS4 GoldHEN"
@@ -102,7 +112,7 @@ _PANEL_SIDEBAR_ICON   = "mdi:sony-playstation"
 _PANEL_WEBCOMPONENT   = "ps4-goldhen-panel"
 
 _JS_STATIC_URL            = "/api/ps4_goldhen/frontend/ps4-goldhen-panel.js"
-_JS_MODULE_URL            = f"{_JS_STATIC_URL}?v=1.0.0"  # cache bust: change it with every panel change
+_JS_MODULE_URL            = f"{_JS_STATIC_URL}?v=1.1.0"  # cache bust: change it with every panel change
 _LOGO_STATIC_URL          = "/api/ps4_goldhen/frontend/goldhen_logo.png"
 _PAYLOAD_ICONS_STATIC_URL = "/api/ps4_goldhen/frontend/payload_icons"
 
@@ -163,6 +173,10 @@ _REST_HEARTBEAT_GRACE = 90.0
 # klog silent this long while the state says rest / off → ask DDP whether the console woke up.
 # Also the gap between two such checks (one SRCH a minute at most).
 _STALE_KLOG_CHECK = 60.0
+# klog silent this long while the state says on → the same DDP check, to catch a frozen console (klog connected but
+# silent, keepalives answered, no DDP reply). This many no-replies in a row → not responding.
+_FROZEN_SILENCE = 300.0
+_FROZEN_MISSES = 2
 
 _KLOG_NOISE_PATTERNS = (
     re.compile(r"\bD88391\b",                    re.IGNORECASE),
@@ -189,6 +203,7 @@ def _ensure_domain_root(hass: HomeAssistant) -> dict[str, Any]:
     g.setdefault("ws_registered",              False)
     g.setdefault("bundled_payloads_installed", False)
     g.setdefault("http_views_registered",      False)
+    g.setdefault("shared_covers_dropped",      False)
     return root
 
 
@@ -327,9 +342,34 @@ def _is_real_game_title_id(value: str | None) -> bool:
 
 
 # ── Cover image disk cache ─────────────────────────────────────────────────────
+# One folder per console (its config entry ID): the same title can have a different icon on each console (a homebrew
+# that restyles icons, a custom icon), and each console shows its own.
 
-def _cover_cache_path(tid: str) -> Path:
-    return Path(COVER_CACHE_DIR) / f"{tid.upper()}.png"
+_ICON_PATH = "/user/appmeta/{tid}/icon0.png"
+
+
+def _cover_cache_path(console: str, tid: str) -> Path:
+    return Path(COVER_CACHE_DIR) / console / f"{tid.upper()}.png"
+
+
+def _read_cached_cover(console: str, tid: str) -> bytes | None:
+    """Blocking — the cover from HA's disk cache, None when it isn't there (no FTP)."""
+    try:
+        return _cover_cache_path(console, tid).read_bytes()
+    except OSError:
+        return None
+
+
+def _write_cached_cover(cache_file: Path, img_bytes: bytes) -> None:
+    """Written whole, then renamed into place: covers are read without the FTP lock while the check rewrites them."""
+    try:
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        part = cache_file.with_suffix(".part")
+        part.write_bytes(img_bytes)
+        os.replace(part, cache_file)
+        _LOGGER.debug("[ps4_goldhen] Cover cached: %s", cache_file)
+    except OSError as err:
+        _LOGGER.warning("[ps4_goldhen] Could not write cover cache %s: %s", cache_file, err)
 
 
 def _fetch_cover_ftp(host: str, ftp_port: int, cover_path: str) -> bytes:
@@ -343,13 +383,13 @@ def _fetch_cover_ftp(host: str, ftp_port: int, cover_path: str) -> bytes:
     return buf.getvalue()
 
 
-def _read_or_fetch_cover(host: str, ftp_port: int, tid: str, cover_path: str) -> bytes:
+def _read_or_fetch_cover(host: str, ftp_port: int, console: str, tid: str, cover_path: str) -> bytes:
     """
     Blocking helper — returns cover PNG bytes.
-    1. Check /config/ps4/covers/{TID}.png — return cached bytes if present.
+    1. Check /config/ps4/covers/<console>/<TID>.png — return cached bytes if present.
     2. FTP-fetch from PS4, write to cache, return bytes.
     """
-    cache_file = _cover_cache_path(tid)
+    cache_file = _cover_cache_path(console, tid)
 
     if cache_file.exists():
         _LOGGER.debug("[ps4_goldhen] Cover cache hit: %s", cache_file)
@@ -357,18 +397,100 @@ def _read_or_fetch_cover(host: str, ftp_port: int, tid: str, cover_path: str) ->
 
     _LOGGER.debug("[ps4_goldhen] Cover cache miss for %s — fetching via FTP", tid)
     img_bytes = _fetch_cover_ftp(host, ftp_port, cover_path)
-
-    # Persist to cache
-    try:
-        cache_file.parent.mkdir(parents=True, exist_ok=True)
-        cache_file.write_bytes(img_bytes)
-        _LOGGER.debug("[ps4_goldhen] Cover cached: %s", cache_file)
-    except Exception as err:
-        _LOGGER.warning(
-            "[ps4_goldhen] Could not write cover cache for %s: %s", tid, err
-        )
-
+    _write_cached_cover(cache_file, img_bytes)
     return img_bytes
+
+
+_ICON_GONE = -1  # the title's icon (or its whole folder) is no longer on the console
+
+
+def _console_icon_size(ftp: Any, path: str, use_size: bool) -> tuple[int | None, bool]:
+    """(size of the console's file at `path`, whether SIZE works on this server). Size None = unknown,
+    _ICON_GONE = no such file. SIZE when the server answers it, else a listing of the file's folder."""
+    import ftplib
+    if use_size:
+        try:
+            size = ftp.size(path)
+            if size is not None:
+                return size, True
+        except ftplib.error_perm as err:
+            if str(err)[:3] in ("500", "501", "502", "504"):  # SIZE not supported: listings from here on
+                use_size = False
+        except ValueError:  # a reply that isn't a number
+            use_size = False
+    folder, name = path.rsplit("/", 1)
+    try:
+        entries = list_directory(ftp, folder)
+    except ftplib.error_perm as err:
+        if str(err)[:3] != "550":
+            raise
+        return _ICON_GONE, use_size  # the title's folder is gone (uninstalled)
+    sizes = [e["size"] for e in entries if e["name"] == name and not e["is_dir"]]
+    return (sizes[0] if sizes else _ICON_GONE), use_size
+
+
+def _refresh_cached_covers(host: str, ftp_port: int, console: str) -> int:
+    """Blocking — compare each cached cover with the console's icon0.png (by size) in one FTP session: a changed
+    icon (a homebrew that restyles icons, a game update) is fetched again, an uninstalled title's cover is dropped.
+    Returns how many covers changed."""
+    import ftplib
+    folder = Path(COVER_CACHE_DIR) / console
+    cached = sorted(folder.glob("*.png")) if folder.is_dir() else []
+    if not cached:
+        return 0
+    changed, use_size = 0, True
+    with ftplib.FTP() as ftp:
+        ftp.connect(host, ftp_port, timeout=15)
+        ftp.login()
+        ftp.voidcmd("TYPE I")  # SIZE counts bytes in binary mode
+        for cache_file in cached:
+            path = _ICON_PATH.format(tid=cache_file.stem)
+            size, use_size = _console_icon_size(ftp, path, use_size)
+            if size == _ICON_GONE:
+                cache_file.unlink(missing_ok=True)
+                changed += 1
+            elif size is not None and size != cache_file.stat().st_size:
+                buf = io.BytesIO()
+                ftp.retrbinary(f"RETR {path}", buf.write)
+                _write_cached_cover(cache_file, buf.getvalue())
+                changed += 1
+    _LOGGER.debug("[ps4_goldhen] Covers checked for %s: %d cached, %d changed (SIZE %s)",
+                  host, len(cached), changed, "used" if use_size else "not supported")
+    return changed
+
+
+def _missing_covers(console: str, tids: list[str]) -> list[str]:
+    """Blocking — the title IDs with no cached cover for this console."""
+    return [tid for tid in tids if not _cover_cache_path(console, tid).exists()]
+
+
+def _fetch_covers(host: str, ftp_port: int, console: str, tids: list[str]) -> int:
+    """Blocking — fetch these titles' icon0.png into the console's cache in one FTP session; a title without an icon
+    (550) is skipped. Returns how many were fetched."""
+    import ftplib
+    fetched = 0
+    with ftplib.FTP() as ftp:
+        ftp.connect(host, ftp_port, timeout=15)
+        ftp.login()
+        for tid in tids:
+            buf = io.BytesIO()
+            try:
+                ftp.retrbinary(f"RETR {_ICON_PATH.format(tid=tid)}", buf.write)
+            except ftplib.error_perm as err:
+                if str(err)[:3] != "550":
+                    raise
+                continue
+            _write_cached_cover(_cover_cache_path(console, tid), buf.getvalue())
+            fetched += 1
+    _LOGGER.debug("[ps4_goldhen] Covers fetched for %s: %d of %d", host, fetched, len(tids))
+    return fetched
+
+
+def _drop_shared_cover_cache() -> None:
+    """Blocking — remove covers cached before the per-console folders (one shared /config/ps4/covers/<TID>.png
+    showed one console's icon on every console)."""
+    for old in Path(COVER_CACHE_DIR).glob("*.png"):
+        old.unlink(missing_ok=True)
 
 
 # ── Klog state machine ─────────────────────────────────────────────────────────
@@ -386,9 +508,16 @@ class KlogStateMachine:
         self._connected_at: float | None = None
         self._rest_or_off_seen_since_connect = False
         self.no_user_logged_in: bool = False  # on the choose-user screen
+        # the user who logged in last (8 hex, as klog writes it), kept through rest: the media browser shows
+        # their home-screen folders
+
+        self.login_user_id: str | None = None
         # the game left running behind the home screen (PS button) or in rest; None once it's closed,
         # another game takes focus or the console goes off. Save backup backs it up when it's left.
         self.suspended_title_id: str | None = None
+        # on, but klog silent and no DDP reply (`on_ddp_silence_check`): frozen
+        self.not_responding: bool = False
+        self._ddp_misses = 0
 
     def snapshot(self) -> dict[str, Any]:
         state = self.current_title_id if self.current_title_id else _HOME_SCREEN_STATE
@@ -402,7 +531,9 @@ class KlogStateMachine:
             "power_state":        self.power_state,
             "power_trigger":      self.power_trigger,
             "no_user_logged_in":  self.no_user_logged_in,
+            "login_user_id":      self.login_user_id,
             "suspended_title_id": self.suspended_title_id,
+            "not_responding":     self.not_responding,
         }
 
     def ingest(self, line: str) -> bool:
@@ -422,6 +553,11 @@ class KlogStateMachine:
             return self._set_power(POWER_REST, "keeping_main_on_standby", line)
 
         if _KLOG_POWER_MODE_PATTERN.search(line):
+            # entering rest logs one right after "State Change: MAIN_ON_STANDBY", and a wake on the same connection
+            # logs "State Change: WORKING" first: it only means on when rest / off wasn't seen on this connection
+            # (a wake from deep rest reconnects klog after the WORKING line)
+            if self.power_state != POWER_ON and self._rest_or_off_seen_since_connect:
+                return False
             return self._set_power(POWER_ON, "power_mode_change", line)
 
         # choose-user screen (rest logs everyone out) ↓
@@ -432,7 +568,12 @@ class KlogStateMachine:
             return self._set_no_user(m.group(1) == "0")
         m = _KLOG_ON_LOGIN_PATTERN.search(line)
         if m:  # OnLogin : ffffffff = nobody (the Welcome screen logs it)
-            return self._set_no_user(False) if m.group(1).lower() != "ffffffff" else False
+            user = m.group(1).lower()
+            if user == "ffffffff":
+                return False
+            changed = self.login_user_id != user
+            self.login_user_id = user
+            return self._set_no_user(False) or changed
 
         m = _KLOG_TRIGGER_CODE_PATTERN.search(line)
         if m:
@@ -532,6 +673,7 @@ class KlogStateMachine:
             # seen live on this connection → the heartbeat rule in tick() must not override it
             self._rest_or_off_seen_since_connect = True
             self.no_user_logged_in = False  # only means something while on; the wake logs it again
+            self._clear_not_responding()
         if power == self.power_state:
             return False
         self.power_state = power
@@ -548,6 +690,35 @@ class KlogStateMachine:
     def on_klog_connected(self, now: float) -> None:
         self._connected_at = now
         self._rest_or_off_seen_since_connect = False
+        self._clear_not_responding()
+
+    def on_klog_heard(self) -> bool:
+        """Klog sent data: the console is alive."""
+        return self._clear_not_responding()
+
+    def on_ddp_silence_check(self, code: int | None) -> bool:
+        """DDP's answer while the state says on and klog is silent (None = no reply). `_FROZEN_MISSES` no-replies in a
+        row → not responding; any reply clears it, and `620` (standby) means rest."""
+        if self.power_state != POWER_ON:
+            return False
+        if code is None:
+            self._ddp_misses += 1
+            if self._ddp_misses < _FROZEN_MISSES or self.not_responding:
+                return False
+            self.not_responding   = True
+            self.last_reason      = "ddp_silent_klog_silent"
+            self.last_signal_line = ""
+            return True
+        if code == 620:
+            return self._set_power(POWER_REST, "ddp_rest_klog_silent", "")
+        return self._clear_not_responding()
+
+    def _clear_not_responding(self) -> bool:
+        self._ddp_misses = 0
+        if not self.not_responding:
+            return False
+        self.not_responding = False
+        return True
 
     def on_klog_unreachable(self) -> bool:
         """Connect failed with EHOSTUNREACH: no ARP reply, so the console is fully off (rest still answers and
@@ -733,6 +904,38 @@ async def _klog_stale_check(
     return True
 
 
+async def _klog_frozen_check(
+    hass: HomeAssistant, entry_id: str, host: str, coordinator: DataUpdateCoordinator, silent_for: float
+) -> None:
+    """A console that's on but has sent no klog for `_FROZEN_SILENCE`: does it still answer DDP?
+
+    A frozen console keeps the klog socket open (keepalives answered) but sends nothing and doesn't answer DDP, so HA
+    would keep it playing for hours. Two no-replies in a row → not responding (Status, media player, play time).
+    """
+    entry_data = hass.data[DOMAIN].get(entry_id)
+    if not entry_data or silent_for < _FROZEN_SILENCE:
+        return
+    state_machine = entry_data["klog_state_machine"]
+    if state_machine.power_state != POWER_ON:
+        return
+    try:
+        reply = await async_search(host)
+    except OSError as err:  # can't tell: not a miss
+        _LOGGER.debug("Frozen check: DDP to %s failed: %s", host, err)
+        return
+    was = state_machine.not_responding
+    if not state_machine.on_ddp_silence_check(reply.code if reply is not None else None):
+        return
+    if state_machine.not_responding:
+        _LOGGER.warning(
+            "PS4 at %s not responding: klog silent for %d min and no DDP reply (frozen?)", host, silent_for // 60
+        )
+    elif was:
+        _LOGGER.info("PS4 at %s answers DDP again (%s)", host, reply.code if reply is not None else "?")
+    entry_data["klog_data"].update(state_machine.snapshot())
+    coordinator.async_set_updated_data({**(coordinator.data or {}), **entry_data["klog_data"]})
+
+
 async def _klog_listener_task(
     hass: HomeAssistant,
     entry_id: str,
@@ -776,6 +979,7 @@ async def _klog_listener_task(
 
             text_buffer = ""
             next_stale_check = hass.loop.time() + _STALE_KLOG_CHECK
+            last_heard = hass.loop.time()
 
             while True:
                 try:
@@ -794,12 +998,14 @@ async def _klog_listener_task(
                         if await _klog_stale_check(hass, entry_id, host, coordinator):
                             reconnect_delay = 1
                             break
+                        await _klog_frozen_check(hass, entry_id, host, coordinator, hass.loop.time() - last_heard)
                     continue
 
                 if not chunk:
                     _LOGGER.warning("Klog connection closed by PS4")
                     break
                 next_stale_check = hass.loop.time() + _STALE_KLOG_CHECK
+                last_heard = hass.loop.time()
 
                 text_buffer += chunk.decode("utf-8", errors="replace")
                 lines        = text_buffer.split("\n")
@@ -809,7 +1015,10 @@ async def _klog_listener_task(
                 if not entry_data:
                     break
 
-                changed = False
+                changed = entry_data["klog_state_machine"].on_klog_heard()
+                if changed:
+                    _LOGGER.info("PS4 at %s sends klog again", host)
+                    entry_data["klog_data"].update(entry_data["klog_state_machine"].snapshot())
                 for line in lines[:-1]:
                     line = line.rstrip("\r")
                     # the console-info payload's line (model, serial, firmware) is kept out of the Klog tab
@@ -875,6 +1084,80 @@ async def _klog_listener_task(
         await asyncio.sleep(reconnect_delay)
 
 
+@callback
+def _watch_wake(hass: HomeAssistant, entry_id: str, coordinator: DataUpdateCoordinator) -> None:
+    """Coordinator listener: the console going from rest / off to on wakes the app.db task (`_wait_next_pull`)."""
+    entry_data = hass.data[DOMAIN].get(entry_id)
+    if not entry_data:
+        return
+    power = (coordinator.data or {}).get("power_state")
+    prev, entry_data["db_prev_power"] = entry_data.get("db_prev_power"), power
+    if power == POWER_ON and prev in (POWER_REST, POWER_OFF):
+        entry_data["db_woke_at"] = hass.loop.time()
+        entry_data["db_wake"].set()
+
+
+async def _settled_after_wake(entry_data: dict[str, Any], deadline: float) -> bool:
+    """True once the console has been on, someone logged in, for _WAKE_SETTLE s; False when it goes back to rest /
+    off first, or the hourly pull is due."""
+    loop = asyncio.get_running_loop()
+    machine = entry_data["klog_state_machine"]
+    since: float | None = None
+    while loop.time() < deadline:
+        if machine.power_state != POWER_ON:
+            return False
+        now = loop.time()
+        if machine.no_user_logged_in:  # the choose-user screen
+            since = None
+        elif since is None:
+            since = now
+        elif now - since >= _WAKE_SETTLE:
+            return True
+        await asyncio.sleep(_WAKE_CHECK)
+    return False
+
+
+async def _wait_next_pull(entry_data: dict[str, Any]) -> None:
+    """Until the next app.db pull: DB_REFRESH_INTERVAL, or sooner after a wake, once the console has settled (not
+    within _WAKE_PULL_COOLDOWN of the last pull). No pull runs in a wake's first _WAKE_SETTLE s."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + DB_REFRESH_INTERVAL
+    wake: asyncio.Event = entry_data["db_wake"]
+    while (remaining := deadline - loop.time()) > 0:
+        try:
+            await asyncio.wait_for(wake.wait(), remaining)
+        except TimeoutError:
+            break
+        wake.clear()
+        if loop.time() - entry_data.get("db_last_pull", float("-inf")) < _WAKE_PULL_COOLDOWN:
+            continue
+        if await _settled_after_wake(entry_data, deadline):
+            return
+    woke = entry_data.get("db_woke_at")
+    if woke is not None and (left := woke + _WAKE_SETTLE - loop.time()) > 0:
+        await asyncio.sleep(left)
+
+
+async def _async_sync_covers(
+    hass: HomeAssistant, entry_data: dict[str, Any], console: str, game_map: dict[str, dict[str, Any]]
+) -> None:
+    """After an app.db pull: cached covers the console has changed since (a homebrew that restyles icons, a game
+    update) are fetched again, then every listed title's missing cover, _COVERS_PER_SESSION per FTP session so the
+    panel's FTP gets a turn in between. A failure leaves the rest for the next pull."""
+    host, ftp_port = entry_data["host"], int(entry_data["ftp_port"])
+    try:
+        await ftp_session.run(hass, entry_data, _refresh_cached_covers, host, ftp_port, console)
+        listed = [tid for tid, _name in ps4_db.title_list(game_map)]
+        missing = await hass.async_add_executor_job(_missing_covers, console, listed)
+        for start in range(0, len(missing), _COVERS_PER_SESSION):
+            if entry_data["klog_state_machine"].power_state in (POWER_REST, POWER_OFF):
+                return  # no FTP to a sleeping console; the next pull fetches the rest
+            batch = missing[start:start + _COVERS_PER_SESSION]
+            await ftp_session.run(hass, entry_data, _fetch_covers, host, ftp_port, console, batch)
+    except Exception as err:  # noqa: BLE001 — the covers stay as they are until the next pull
+        _LOGGER.debug("Cover sync failed for %s: %s", host, err)
+
+
 async def _db_refresh_task(
     hass: HomeAssistant,
     entry_id: str,
@@ -906,16 +1189,16 @@ async def _db_refresh_task(
                 cached = await hass.async_add_executor_job(ps4_db.load_cached, host)
                 if cached:
                     entry_data["game_map"] = cached
-            await asyncio.sleep(DB_REFRESH_INTERVAL)
+            await _wait_next_pull(entry_data)
             continue
 
+        entry_data["db_last_pull"] = hass.loop.time()
         try:
             game_map = await ftp_session.run(hass, entry_data, ps4_db.download_and_parse, host, ftp_port)
             entry_data["game_map"] = game_map
             _LOGGER.info(
                 "app.db refreshed for %s — %d titles loaded", host, len(game_map)
             )
-
             klog_data = entry_data["klog_data"]
             tid = klog_data.get(SENSOR_TITLE_ID)
             if tid and tid in game_map:
@@ -925,13 +1208,15 @@ async def _db_refresh_task(
                     {**(coordinator.data or {}), **klog_data}
                 )
 
+            await _async_sync_covers(hass, entry_data, entry_id, game_map)
+
         except asyncio.CancelledError:
             _LOGGER.info("DB refresh task cancelled")
             raise
         except Exception as err:
             _LOGGER.warning("app.db refresh failed for %s: %s", host, err)
 
-        await asyncio.sleep(DB_REFRESH_INTERVAL)
+        await _wait_next_pull(entry_data)
 
 
 # ── WebSocket commands ─────────────────────────────────────────────────────────
@@ -951,6 +1236,7 @@ async def ws_list_entries(
     msg: dict,
 ) -> None:
     entries = hass.config_entries.async_entries(DOMAIN)
+    registry = er.async_get(hass)
     out = [
         {
             "entry_id":       entry.entry_id,
@@ -963,6 +1249,8 @@ async def ws_list_entries(
             "rpi_port":       entry.data.get(CONF_RPI_PORT,       DEFAULT_RPI_PORT),
             # the panel names it before a payload send; None until the console info has a firmware
             "firmware":       _cached_firmware(hass, entry.entry_id),
+            # the panel's Wake / Rest button: this entity's turn_on / turn_off, its state for the label
+            "media_player":   registry.async_get_entity_id("media_player", DOMAIN, media_player_unique_id(entry)),
         }
         for entry in entries
     ]
@@ -1066,6 +1354,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             "ftp_reachable":       False,
         },
         "game_map": {},
+        "db_wake": asyncio.Event(),  # set when the console wakes (`_watch_wake`)
     }
 
     async def _poll_update() -> dict[str, Any]:
@@ -1088,6 +1377,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     await play_time.async_setup(hass, entry)  # before game_session, which it listens to
     game_session.async_setup(hass, entry, coordinator)  # game started / left signals
     await save_backup.async_setup(hass, entry, coordinator)  # off until turned on in the panel
+    games.register_once(hass)  # the panel's Content tab (reads what the modules above hold)
 
     klog_task = entry.async_create_background_task(
         hass,
@@ -1096,6 +1386,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     )
     root[entry.entry_id]["klog_task"] = klog_task
 
+    entry.async_on_unload(coordinator.async_add_listener(partial(_watch_wake, hass, entry.entry_id, coordinator)))
     db_task = entry.async_create_background_task(
         hass,
         _db_refresh_task(hass, entry.entry_id, coordinator),
@@ -1118,6 +1409,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         await hass.async_add_executor_job(_copy_bundled_payloads_to_config)
         g["bundled_payloads_installed"] = True
 
+    if not g["shared_covers_dropped"]:
+        await hass.async_add_executor_job(_drop_shared_cover_cache)
+        g["shared_covers_dropped"] = True
+
     if not g.get("http_views_registered"):
         hass.http.register_view(PS4FTPDownloadView())
         hass.http.register_view(PS4FTPUploadView())
@@ -1127,7 +1422,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         {
             vol.Required("payload_file"): str,
             vol.Optional("ps4_host"): str,
-            # still accepted so older automations don't fail; ignored (the console's own port is used)
+            # overrides the console's own port for this call
             vol.Optional("binloader_port"): vol.All(
                 vol.Coerce(int), vol.Range(min=1024, max=65535)
             ),
@@ -1138,9 +1433,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     )
 
     async def handle_send_payload(call: ServiceCall) -> None:
-        p_file   = call.data["payload_file"]
-        # one of THIS integration's consoles, on its own BinLoader port. The service is registered once
-        # (first entry), so it must not close over that entry's host (or every payload would go to the first console).
+        # one of THIS integration's consoles, on its own BinLoader port unless the call gives one. The service is
+        # registered once (first entry), so it must not close over that entry's host (or every payload would go to
+        # the first console). Only a file directly inside PAYLOAD_DIR, never any other HA path.
         try:
             t_host, t_port = payload_target(
                 (e.data for e in hass.config_entries.async_entries(DOMAIN)),
@@ -1149,24 +1444,52 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 port_key=CONF_BINLOADER_PORT,
                 default_port=DEFAULT_BINLOADER_PORT,
             )
+            filepath = payload_path(PAYLOAD_DIR, call.data["payload_file"])
         except ValueError as err:
             raise HomeAssistantError(str(err)) from err
-        # payloads only from PAYLOAD_DIR (never any other HA path)
-        filepath = os.path.realpath(os.path.join(PAYLOAD_DIR, os.path.basename(p_file)))
-        if os.path.dirname(filepath) != os.path.realpath(PAYLOAD_DIR):
-            raise ValueError("payload_file must be a file in " + PAYLOAD_DIR)
+        if call.data.get("binloader_port"):
+            t_port = int(call.data["binloader_port"])
         await _send_bin_tcp(t_host, t_port, filepath, call.data.get("timeout", 30))
 
-    if not hass.services.has_service(DOMAIN, _SVC_SEND_PAYLOAD):
-        hass.services.async_register(
-            DOMAIN, _SVC_SEND_PAYLOAD, handle_send_payload,
-            schema=_SEND_PAYLOAD_SCHEMA,
-        )
+    _register_admin_service(hass, _SVC_SEND_PAYLOAD, handle_send_payload, _SEND_PAYLOAD_SCHEMA)
+
+    async def handle_close_title(call: ServiceCall) -> None:
+        # the console is picked like send_payload's: one of this integration's, ps4_host when there are several
+        try:
+            t_host, _port = payload_target(
+                (e.data for e in hass.config_entries.async_entries(DOMAIN)),
+                call.data.get("ps4_host"),
+                host_key=CONF_PS4_HOST,
+                port_key=CONF_BINLOADER_PORT,
+                default_port=DEFAULT_BINLOADER_PORT,
+            )
+        except ValueError as err:
+            raise HomeAssistantError(str(err)) from err
+        loaded = _ensure_domain_root(hass)
+        target = next((e for e in hass.config_entries.async_entries(DOMAIN)
+                       if (e.data.get(CONF_PS4_HOST) or "").strip() == t_host and e.entry_id in loaded), None)
+        if target is None:
+            raise HomeAssistantError(f"The PS4 at {t_host} isn't loaded in PS4 GoldHEN")
+        from .launch import async_close_title  # the button platform loads it
+        await async_close_title(hass, target, call.data["title_id"])
+
+    _register_admin_service(hass, _SVC_CLOSE_TITLE, handle_close_title,
+                            vol.Schema({vol.Required("title_id"): str, vol.Optional("ps4_host"): str}))
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
 
     return True
+
+
+def _register_admin_service(hass: HomeAssistant, name: str, handler, schema) -> None:
+    """Once per HA start (the first entry). Admin-only like the panel: HA refuses a call from a non-admin user
+    (Unauthorized); calls without a user, such as automations, still run."""
+    if hass.services.has_service(DOMAIN, name):
+        return
+    from homeassistant.helpers.service import async_register_admin_service
+
+    async_register_admin_service(hass, DOMAIN, name, handler, schema=schema)
 
 
 # ── HTTP views ─────────────────────────────────────────────────────────────────
@@ -1195,6 +1518,7 @@ class PS4FTPDownloadView(HomeAssistantView):
                 ftp.retrbinary(f"RETR {path}", buf.write)
             return buf.getvalue()
         try:
+            ftp_session.check_awake(data)
             content = await ftp_session.run(request.app["hass"], data, _get_file, wait=ftp_session.FTP_BUSY_WAIT)
             return web.Response(
                 body=content,
@@ -1204,6 +1528,8 @@ class PS4FTPDownloadView(HomeAssistantView):
                         f'attachment; filename="{os.path.basename(path)}"'
                 },
             )
+        except ftp_session.ConsoleAsleep as err:
+            return web.Response(text=str(err), status=409)
         except ftp_session.FTPBusy as err:
             return web.Response(text=str(err), status=503)
         except Exception as err:
@@ -1244,9 +1570,12 @@ class PS4FTPUploadView(HomeAssistantView):
                 ftp.login()
                 ftp.storbinary(f"STOR {full_dest}", io.BytesIO(content))
         try:
+            ftp_session.check_awake(data)
             content = await file_field.read(decode=True)  # before the lock: the browser's upload isn't FTP time
             await ftp_session.run(request.app["hass"], data, _upload, content, wait=ftp_session.FTP_BUSY_WAIT)
             return web.json_response({"success": True, "path": full_dest})
+        except ftp_session.ConsoleAsleep as err:
+            return web.Response(text=str(err), status=409)
         except ftp_session.FTPBusy as err:
             return web.Response(text=str(err), status=503)
         except Exception as err:
@@ -1276,9 +1605,11 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 
 async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """A deleted console takes its cached console info with it."""
+    """A deleted console takes its cached console info and covers with it."""
     await console_info.async_remove(hass, entry)
     await fan.async_remove(hass, entry)
     await screenshots.async_remove(hass, entry)  # settings + thumbnail cache (copies stay)
     await play_time.async_remove(hass, entry)
     await save_backup.async_remove(hass, entry)  # settings + download zips (backups stay)
+    covers = Path(COVER_CACHE_DIR) / entry.entry_id
+    await hass.async_add_executor_job(partial(shutil.rmtree, covers, ignore_errors=True))

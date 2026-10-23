@@ -3,12 +3,13 @@ send_payload:
   description: >-
     Stream a .bin or .elf payload file to the PS4 GoldHEN BinLoader over TCP.
     Successful transfer does not confirm execution or firmware compatibility.
-    The file must be inside /config/ps4/payloads/ (only the file name is used, never a path).
+    The file must be inside /config/ps4/payloads/, and it can only go to a console set up in this integration.
+    Admin users only; automations can call it too.
   fields:
     payload_file:
       name: Payload File
       description: >-
-        File name (e.g. goldhen.bin or payload.elf) inside /config/ps4/payloads/. Only the name is used, never a path.
+        File name (e.g. goldhen.bin or payload.elf) of a file directly inside /config/ps4/payloads/, or its full path there. Other paths and ".." are refused.
       required: true
       example: goldhen.bin
       selector:
@@ -20,6 +21,16 @@ send_payload:
       example: 192.168.1.100
       selector:
         text:
+    binloader_port:
+      name: BinLoader Port (optional)
+      description: BinLoader TCP port for this call. Without it, the port from the chosen console's entry is used.
+      required: false
+      example: 9090
+      selector:
+        number:
+          min: 1024
+          max: 65535
+          mode: box
     timeout:
       name: Timeout (seconds)
       description: TCP connect/drain timeout per operation, not a whole-transfer deadline. Default is 30.
@@ -30,3 +41,25 @@ send_payload:
           min: 1
           max: 300
           mode: box
+
+close_title:
+  name: Close title
+  description: >-
+    Close one game or app on the PS4, in front or in the background. Unsaved progress is lost, as with the console's
+    Close Application. Nothing happens if the title isn't running. System apps such as the Internet Browser can't be
+    closed from HA. Admin users only; automations can call it too.
+  fields:
+    title_id:
+      name: Title ID
+      description: The game's or app's title ID (the media player's media_content_id while it's in front).
+      required: true
+      example: CUSA12345
+      selector:
+        text:
+    ps4_host:
+      name: PS4 Host (optional)
+      description: Which PS4 (its IP). Must be one set up in PS4 GoldHEN; required when more than one is.
+      required: false
+      example: 192.168.1.100
+      selector:
+        text:

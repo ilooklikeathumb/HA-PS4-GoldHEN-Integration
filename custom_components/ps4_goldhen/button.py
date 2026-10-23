@@ -1,4 +1,4 @@
-"""PS4 GoldHEN buttons: Rest mode, Read console info, Close game."""
+"""PS4 GoldHEN buttons: Rest mode, Read console info, Close application."""
 from __future__ import annotations
 
 from homeassistant.components.button import ButtonEntity
@@ -10,7 +10,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from .console_info import async_read as async_read_console_info
 from .const import DOMAIN, CONF_PS4_HOST
 from .entity import ps4_device_info
-from .launch import async_close_game
+from .launch import async_close_front
 from .rest import async_enter_rest
 
 
@@ -73,17 +73,18 @@ class PS4ConsoleInfoButton(ButtonEntity):
 
 
 class PS4CloseGameButton(ButtonEntity):
-    """Close the running game, back to the home screen. Unsaved progress is lost."""
+    """Close the game or app in front; at the home screen, the game suspended behind it. Unsaved progress is lost."""
     _attr_has_entity_name = True
     _attr_icon = "mdi:close-box-outline"
 
     def __init__(self, entry: ConfigEntry) -> None:
         self._entry = entry
         host = entry.data[CONF_PS4_HOST]
+        # unique_id keeps `close_game` (the button's first name), so an upgrade keeps the entity ID
         self._attr_unique_id = f"{DOMAIN}_{host}_close_game"
         self._attr_device_info = ps4_device_info(entry)
-        self._attr_name = "Close game"
+        self._attr_name = "Close application"
 
     async def async_press(self) -> None:
-        """Send the launch payload in close-only mode; the media player goes idle when klog reports it."""
-        await async_close_game(self.hass, self._entry)
+        """Send the launch payload in close-only mode; the media player follows when klog reports it."""
+        await async_close_front(self.hass, self._entry)

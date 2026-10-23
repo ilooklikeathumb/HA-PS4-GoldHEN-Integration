@@ -1,4 +1,5 @@
-"""The hourly app.db refresh skips the FTP pull while the console is in rest / off.
+"""The app.db refresh skips the FTP pull while the console is in rest / off, and syncs the covers after a pull.
+Between pulls it waits in `_wait_next_pull` (test_wake_pull.py has the real one).
 
 Runs the real _db_refresh_task from __init__.py (extracted, like test_klog_power_state) against stand-ins.
 """
@@ -20,15 +21,13 @@ class _StopLoop(Exception):
 
 
 def load_task(db, on_short_sleep=None):
-    """_db_refresh_task with its own asyncio stand-in. The hourly sleep stops the loop; the start-up wait's short
-    sleeps return at once (on_short_sleep runs first, so a test can make the power state arrive mid-wait)."""
+    """_db_refresh_task with its own asyncio stand-in. The wait for the next pull stops the loop; the start-up wait's
+    short sleeps return at once (on_short_sleep runs first, so a test can make the power state arrive mid-wait)."""
     ns: dict[str, Any] = {"_LOGGER": logging.getLogger("db-refresh-test"), "ps4_db": db,
                           "HomeAssistant": object, "DataUpdateCoordinator": object, "short_sleeps": []}
     exec(compile(CONST.read_text(), str(CONST), "exec"), ns)
 
     async def sleep(delay):
-        if delay == ns["DB_REFRESH_INTERVAL"]:
-            raise _StopLoop
         ns["short_sleeps"].append(delay)
         if on_short_sleep:
             on_short_sleep()
@@ -39,7 +38,16 @@ def load_task(db, on_short_sleep=None):
         ns["locked_runs"].append(func)
         return await hass.async_add_executor_job(func, *args)
 
+    async def wait_next_pull(entry_data):
+        raise _StopLoop
+
+    async def sync_covers(hass, entry_data, console, game_map):  # test_wake_pull.py has the real one
+        ns["cover_syncs"].append((console, game_map))
+
     ns["locked_runs"] = []
+    ns["cover_syncs"] = []
+    ns["_wait_next_pull"] = wait_next_pull
+    ns["_async_sync_covers"] = sync_covers
     ns["ftp_session"] = types.SimpleNamespace(run=run)
     keep = [node for node in ast.parse(INIT.read_text()).body
             if (isinstance(node, ast.AsyncFunctionDef) and node.name == "_db_refresh_task")
@@ -66,6 +74,7 @@ class FakeDb:
 class FakeHass:
     def __init__(self, entry_data):
         self.data = {"ps4_goldhen": {"e1": entry_data}}
+        self.loop = types.SimpleNamespace(time=lambda: 1234.0)
 
     async def async_add_executor_job(self, func, *args):
         return func(*args)
@@ -111,7 +120,10 @@ class DbRefreshTests(unittest.TestCase):
         db, entry_data, ns = run_one_round(POWER_ON)
         self.assertEqual(db.pulls, [("192.0.2.10", 2121)])
         self.assertEqual(ns["locked_runs"], [db.download_and_parse], "the pull runs under the FTP lock")
+        self.assertEqual(ns["cover_syncs"], [("e1", {"CUSA00001": {"name": "Pulled"}})],
+                         "then this console's covers (entry ID), with the new game list")
         self.assertEqual(entry_data["game_map"], {"CUSA00001": {"name": "Pulled"}})
+        self.assertEqual(entry_data["db_last_pull"], 1234.0, "the wake pull's cooldown counts from here")
 
     def test_known_power_needs_no_wait(self):
         for power in (POWER_ON, POWER_REST):
@@ -132,8 +144,10 @@ class DbRefreshTests(unittest.TestCase):
     def test_rest_and_off_skip_the_pull(self):
         for power in (POWER_REST, POWER_OFF):
             with self.subTest(power=power):
-                db, entry_data, _ = run_one_round(power, game_map={"CUSA00002": {"name": "Kept"}})
+                db, entry_data, ns = run_one_round(power, game_map={"CUSA00002": {"name": "Kept"}})
                 self.assertEqual(db.pulls, [])
+                self.assertEqual(ns["cover_syncs"], [], "no FTP to a sleeping console")
+                self.assertNotIn("db_last_pull", entry_data)
                 self.assertEqual(db.cache_reads, [])  # a map is loaded already: nothing to do
                 self.assertEqual(entry_data["game_map"], {"CUSA00002": {"name": "Kept"}})
 

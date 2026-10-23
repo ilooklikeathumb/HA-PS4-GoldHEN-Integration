@@ -1,4 +1,4 @@
-"""Launch / close game — the payload's title ID slot, and the checks before it is sent.
+"""Launch / close a title — the payload's title ID slot, and the checks before it is sent.
 
 Runs the real launch.py (+ rest.py's preflight) against minimal HA stand-ins (no HA install needed); DDP and the
 payload send are faked.
@@ -116,6 +116,13 @@ class BuildPayloadTests(unittest.TestCase):
     def test_close_only_slot(self):
         self.assertEqual(slot(launch.build_payload(ELF, None, close_first=True)), b"\0" * 10 + b"K" + b"\0" * 5)
 
+    def test_close_title_slot(self):
+        self.assertEqual(slot(launch.build_payload(ELF, "APOL00004", close_first=False, close_only=True)),
+                         b"APOL00004\0C" + b"\0" * 5)
+        for tid in (None, "NPXS20102"):  # C needs a title; never a system app (the Browser is the home screen's app)
+            with self.subTest(tid=tid), self.assertRaises(HomeAssistantError):
+                launch.build_payload(ELF, tid, close_first=False, close_only=True)
+
     def test_resume_only_slot(self):
         self.assertEqual(slot(launch.build_payload(ELF, None, close_first=False, resume_only=True)),
                          b"\0" * 10 + b"R" + b"\0" * 5)
@@ -153,6 +160,11 @@ class LaunchTests(unittest.TestCase):
         self.assertEqual((host, port, name), ("192.0.2.1", 9090, "launch-app.elf"))
         self.assertEqual(slot(data), b"CUSA90001\0K" + b"\0" * 5)
 
+    def test_app_never_closes_running_game(self):  # no K: the console asks on the TV if the game has to go
+        run(launch.async_launch_title(Hass({"power_state": "on", "title_id": "CUSA90004"}), Entry(), "APOL00004",
+                                      close_first=False))
+        self.assertEqual(slot(SENDS[0][2]), b"APOL00004" + b"\0" * 7)
+
     def test_from_home_screen(self):
         run(launch.async_launch_title(Hass({"power_state": "on"}), Entry(), "CUSA90001"))
         self.assertEqual(slot(SENDS[0][2]), b"CUSA90001\0K" + b"\0" * 5)  # K is harmless with nothing running
@@ -178,9 +190,36 @@ class LaunchTests(unittest.TestCase):
             run(launch.async_launch_title(Hass({"power_state": "on"}), Entry(), "CUSA90001"))
         self.assertEqual(SENDS, [])
 
-    def test_close_game(self):
-        run(launch.async_close_game(Hass({"power_state": "on", "title_id": "CUSA90001"}), Entry()))
+    # — Close application: whatever is in front —
+
+    def test_close_game_in_front(self):
+        run(launch.async_close_front(Hass({"power_state": "on", "title_id": "CUSA90001"}), Entry()))
+        self.assertEqual(slot(SENDS[0][2]), b"CUSA90001\0C" + b"\0" * 5)
+
+    def test_close_app_in_front(self):  # an app is never the big app: K would leave it open and close the game behind
+        run(launch.async_close_front(Hass({"power_state": "on", "title_id": "APOL00004"}), Entry()))
+        self.assertEqual(slot(SENDS[0][2]), b"APOL00004\0C" + b"\0" * 5)
+
+    def test_close_at_home_screen_closes_suspended_game(self):
+        run(launch.async_close_front(Hass({"power_state": "on", "title_id": None}), Entry()))
         self.assertEqual(slot(SENDS[0][2]), b"\0" * 10 + b"K" + b"\0" * 5)
+
+    def test_close_in_rest_sends_nothing(self):
+        with self.assertRaises(HomeAssistantError):
+            run(launch.async_close_front(Hass({"power_state": "rest", "title_id": "CUSA90001"}), Entry()))
+        self.assertEqual(SENDS, [])
+
+    # — close_title service —
+
+    def test_close_title(self):
+        run(launch.async_close_title(Hass({"power_state": "on", "title_id": "CUSA90001"}), Entry(), " item00001 "))
+        self.assertEqual(slot(SENDS[0][2]), b"ITEM00001\0C" + b"\0" * 5)
+
+    def test_close_title_refusals_send_nothing(self):
+        for tid in ("NPXS20102", "NPXS20001", "not-a-title", ""):
+            with self.subTest(tid=tid), self.assertRaises(HomeAssistantError):
+                run(launch.async_close_title(Hass({"power_state": "on"}), Entry(), tid))
+        self.assertEqual(SENDS, [])
 
 
 class AfterWakeTests(unittest.TestCase):

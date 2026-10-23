@@ -32,6 +32,7 @@ class MediaPlayerEntityFeature(enum.IntFlag):
 
 
 class MediaClass(enum.StrEnum):
+    APP = "app"
     DIRECTORY = "directory"
     GAME = "game"
 
@@ -56,6 +57,7 @@ class MediaPlayerState(str, enum.Enum):
 
 
 class MediaType(enum.StrEnum):  # HA: StrEnum, formats as "game"
+    APP = "app"
     GAME = "game"
 
 
@@ -68,14 +70,6 @@ class MediaPlayerEntity:
     def media_image_url(self):
         return None
 
-    @property
-    def media_image_hash(self):
-        url = self.media_image_url
-        return None if url is None else "urlhash:" + url
-
-    async def async_get_media_image(self):
-        return b"cdn:" + self.media_image_url.encode(), "image/jpeg"
-
     def get_browse_image_url(self, media_content_type, media_content_id, media_image_id=None):
         return f"/api/media_player_proxy/media_player.ps4/browse_media/{media_content_type}/{media_content_id}?token=t"
 
@@ -83,6 +77,12 @@ class MediaPlayerEntity:
 class CoordinatorEntity:
     def __init__(self, coordinator):
         self.coordinator = coordinator
+
+    async def async_added_to_hass(self):
+        pass
+
+    async def async_will_remove_from_hass(self):
+        pass
 
 
 class HomeAssistantError(Exception):
@@ -127,10 +127,15 @@ _module("homeassistant.helpers.update_coordinator", CoordinatorEntity=Coordinato
 _module("homeassistant.helpers.device_registry", DeviceInfo=dict)
 
 FTP_FETCHES = []
+CACHED_COVERS: dict = {}  # HA's cover cache on disk: (console = entry ID, title ID) -> bytes
 
 
-def fake_read_or_fetch_cover(host, ftp_port, tid, cover_path):
-    FTP_FETCHES.append((host, ftp_port, tid, cover_path))
+def fake_read_cached_cover(console, tid):
+    return CACHED_COVERS.get((console, tid))
+
+
+def fake_read_or_fetch_cover(host, ftp_port, console, tid, cover_path):
+    FTP_FETCHES.append((host, ftp_port, console, tid, cover_path))
     return b"png:" + tid.encode()
 
 
@@ -139,7 +144,8 @@ async def fake_send_bin_tcp(*args, **kwargs):  # rest.py imports it; turn off is
 
 
 pkg = _module(
-    PKG, _read_or_fetch_cover=fake_read_or_fetch_cover, _send_bin_tcp=fake_send_bin_tcp, _send_bin_bytes=fake_send_bin_tcp
+    PKG, _read_or_fetch_cover=fake_read_or_fetch_cover, _read_cached_cover=fake_read_cached_cover,
+    _send_bin_tcp=fake_send_bin_tcp, _send_bin_bytes=fake_send_bin_tcp
 )
 pkg.__path__ = [str(COMP)]
 import importlib  # noqa: E402
@@ -189,11 +195,13 @@ mp_mod.async_enter_rest = fake_enter_rest
 
 LAUNCHES = []
 LAUNCHES_AFTER_WAKE = []  # the after_wake flag of each launch, same order as LAUNCHES
+LAUNCHES_CLOSE_FIRST = []  # the close_first flag of each launch, same order as LAUNCHES
 
 
-async def fake_launch_title(hass, entry, title_id, *, after_wake=False):
+async def fake_launch_title(hass, entry, title_id, *, after_wake=False, close_first=True):
     LAUNCHES.append(title_id)
     LAUNCHES_AFTER_WAKE.append(after_wake)
+    LAUNCHES_CLOSE_FIRST.append(close_first)
 
 
 mp_mod.async_launch_title = fake_launch_title
@@ -210,16 +218,30 @@ async def fake_resume_suspended(hass, entry):
 
 mp_mod.async_resume_suspended = fake_resume_suspended
 
+LAYOUT_CALLS = []
+LAYOUT = {}  # db.folder_layout's answer from the cached app.db; empty = no cache
 
-def game(name, last, ui="game"):
-    return {"name": name, "cover": None, "cdn_cover": None, "ui_category": ui, "last_access": last}
+
+def fake_folder_layout(host, user_id):
+    LAYOUT_CALLS.append((host, user_id))
+    return dict(LAYOUT) or None
+
+
+mp_mod.folder_layout = fake_folder_layout
+
+
+def game(name, last, ui="game", category="gd"):
+    return {"name": name, "cover": None, "ui_category": ui, "category": category,
+            "last_access": last}
 
 
 GAMES = {
     "CUSA90003": game("Game C", "2026-10-15 01:23"),
     "CUSA90001": game("Game B", "2025-10-27 13:37"),
     "CUSA90004": game("Game A\u2122", "2026-10-13 19:55"),
-    "CUSA90002": game("Spotify", "2026-10-14 20:32", ui="app"),
+    "CUSA90002": game("Spotify", "2026-10-14 20:32", ui="app", category="gdn"),
+    "APOL00004": game("Apollo Save Tool", "2026-10-12 04:55", ui="app", category="gde"),
+    "NPXS20111": game("Library", "2026-10-16 13:48", ui="app", category="gdi"),  # built in: not listed
 }
 
 
@@ -259,6 +281,9 @@ class StateTests(unittest.TestCase):
             ({"power_state": "on", "title_id": "CUSA90003"}, S.PLAYING),
             ({"title_id": "CUSA90003"}, S.PLAYING),  # game seen before the power heartbeat
             ({}, None),                              # unknown until klog reports
+            ({"power_state": "on", "title_id": "CUSA90003", "not_responding": True}, None),  # frozen
+            ({"power_state": "on", "not_responding": True}, None),
+            ({"power_state": "rest", "not_responding": True}, S.OFF),
         ]
         for data, expected in cases:
             with self.subTest(data=data):
@@ -274,11 +299,17 @@ class StateTests(unittest.TestCase):
         e, *_ = make({"power_state": "on"})
         self.assertIsNone(e.media_title)
         self.assertIsNone(e.media_content_type)
+        e, *_ = make({"power_state": "on", "title_id": "CUSA90003", "not_responding": True})
+        self.assertIsNone(e.media_title)  # frozen: no game shown
+        self.assertIsNone(e.media_content_id)
 
     def test_power_state_attribute(self):
         for power in ("on", "rest", "off", None):
             with self.subTest(power=power):
-                self.assertEqual(make({"power_state": power})[0].extra_state_attributes, {"power_state": power})
+                self.assertEqual(make({"power_state": power})[0].extra_state_attributes,
+                                 {"power_state": power, "not_responding": False})
+        self.assertEqual(make({"power_state": "on", "not_responding": True})[0].extra_state_attributes,
+                         {"power_state": "on", "not_responding": True})
 
     def test_features(self):
         F = MediaPlayerEntityFeature
@@ -293,19 +324,21 @@ class CoverTests(unittest.TestCase):
     def setUp(self):
         FTP_FETCHES.clear()
 
-    def test_cdn_cover(self):
-        e, *_ = make({"power_state": "on", "title_id": "CUSA90003"}, {"CUSA90003": {"cdn_cover": "https://cdn.example/r.png"}})
-        self.assertEqual(e.media_image_url, "https://cdn.example/r.png")
-        self.assertEqual(e.media_image_hash, "urlhash:https://cdn.example/r.png")
-        self.assertEqual(run(e.async_get_media_image()), (b"cdn:https://cdn.example/r.png", "image/jpeg"))
-        self.assertEqual(FTP_FETCHES, [])
-
-    def test_console_icon_when_no_cdn(self):
+    def test_console_icon(self):  # the console's own icon0.png, never a URL (app.db's store link isn't read)
         e, *_ = make({"power_state": "on", "title_id": "CUSA90003"}, {"CUSA90003": {"cover": "/user/appmeta/CUSA90003/icon0.png"}})
         self.assertIsNone(e.media_image_url)
         self.assertEqual(e.media_image_hash, "CUSA90003")
         self.assertEqual(run(e.async_get_media_image()), (b"png:CUSA90003", "image/png"))
-        self.assertEqual(FTP_FETCHES, [("192.0.2.1", 2121, "CUSA90003", "/user/appmeta/CUSA90003/icon0.png")])
+        self.assertEqual(FTP_FETCHES, [("192.0.2.1", 2121, "E1", "CUSA90003", "/user/appmeta/CUSA90003/icon0.png")])
+
+    def test_cache_is_per_console(self):  # the same title can have a different icon on another console
+        CACHED_COVERS[("OTHER", "CUSA90003")] = b"other console's icon"
+        try:
+            e, *_ = make({"power_state": "on", "title_id": "CUSA90003"})
+            self.assertEqual(run(e.async_get_media_image()), (b"png:CUSA90003", "image/png"))
+            self.assertEqual([f[2:4] for f in FTP_FETCHES], [("E1", "CUSA90003")], "fetched from this console")
+        finally:
+            CACHED_COVERS.clear()
 
     def test_no_game_no_picture(self):
         for data in ({"power_state": "on"}, {"power_state": "rest", "title_id": "CUSA90003"}, {"power_state": "off"}):
@@ -334,6 +367,26 @@ class CoverTests(unittest.TestCase):
             mp_mod._read_or_fetch_cover = original
         self.assertEqual(held, [True], "fetched under the console's FTP lock")
         self.assertFalse(entry_data["ftp_lock"].locked(), "released after")
+
+    def test_cached_cover_no_ftp_and_none_to_a_sleeping_console(self):  # a cover grid asks for every title at once
+        CACHED_COVERS.clear()
+        CACHED_COVERS[("E1", "CUSA90001")] = b"disk:CUSA90001"
+        try:
+            for power in ("on", "rest", "off"):
+                with self.subTest(power=power):
+                    e, entry_data, _ = make({"power_state": power}, GAMES)
+                    self.assertEqual(run(e.async_get_browse_image("game", "CUSA90001")), (b"disk:CUSA90001", "image/png"))
+                    self.assertNotIn("ftp_lock", entry_data, "a cached cover doesn't wait for the FTP lock")
+            for power in ("rest", "off"):
+                with self.subTest(power=power):
+                    e, *_ = make({"power_state": power}, GAMES)
+                    self.assertEqual(run(e.async_get_browse_image("game", "CUSA90003")), (None, None))
+            self.assertEqual(FTP_FETCHES, [], "no FTP to a console in rest or off")
+            e, *_ = make({"power_state": "on"}, GAMES)
+            self.assertEqual(run(e.async_get_browse_image("game", "CUSA90003")), (b"png:CUSA90003", "image/png"))
+            self.assertEqual([f[3] for f in FTP_FETCHES], ["CUSA90003"], "on: a missing cover is fetched")
+        finally:
+            CACHED_COVERS.clear()
 
 
 class TurnOnTests(unittest.TestCase):
@@ -528,8 +581,14 @@ class LaunchFromRestTests(unittest.TestCase):
     """Picking a game in rest wakes + logs in first; the payload resumes it if it's the suspended one"""
 
     def setUp(self):
-        for log in (WAKES, LOGINS, DDP_CODES, LOGIN_FAILURE, RESUMES, LAUNCHES, LAUNCHES_AFTER_WAKE):
+        for log in (WAKES, LOGINS, DDP_CODES, LOGIN_FAILURE, RESUMES, LAUNCHES, LAUNCHES_AFTER_WAKE,
+                    LAUNCHES_CLOSE_FIRST):
             log.clear()
+
+    def test_app_in_rest_never_closes_the_game(self):  # the suspended game stays for an app too
+        e, *_ = make({"power_state": "rest"}, GAMES, options={"regist_key": KEY, "rp_key": RP_KEY})
+        run(e.async_select_source("Apollo Save Tool"))
+        self.assertEqual((LAUNCHES, LAUNCHES_AFTER_WAKE, LAUNCHES_CLOSE_FIRST), (["APOL00004"], [True], [False]))
 
     def test_select_source_in_rest_wakes_logs_in_launches(self):
         e, *_ = make({"power_state": "rest"}, GAMES, options={"regist_key": KEY, "rp_key": RP_KEY})
@@ -596,9 +655,10 @@ class TurnOffTests(unittest.TestCase):
         self.assertEqual(hass.services.calls, [])
 
 
-class GameListTests(unittest.TestCase):
+class TitleListTests(unittest.TestCase):
     def setUp(self):
         LAUNCHES.clear()
+        LAUNCHES_CLOSE_FIRST.clear()
         FTP_FETCHES.clear()
 
     def test_features_with_games(self):
@@ -606,63 +666,165 @@ class GameListTests(unittest.TestCase):
         e, *_ = make({}, GAMES)
         self.assertEqual(e.supported_features, F.TURN_OFF | F.SELECT_SOURCE | F.BROWSE_MEDIA | F.PLAY_MEDIA)
 
-    def test_source_list_games_last_played_first(self):
+    def test_source_list_games_and_apps_last_played_first(self):
         e, *_ = make({"power_state": "on"}, GAMES)
-        self.assertEqual(e.source_list, ["Game C", "Game A\u2122", "Game B"])  # no apps
+        self.assertEqual(e.source_list, ["Game C", "Spotify", "Game A\u2122", "Apollo Save Tool", "Game B"])
         self.assertIsNone(e.source)
         self.assertIsNone(make({})[0].source_list)
 
-    def test_source_is_running_game(self):
+    def test_source_is_running_title(self):
         e, *_ = make({"power_state": "on", "title_id": "CUSA90001"}, GAMES)
-        self.assertEqual(e.source, "Game B")
+        self.assertEqual((e.source, e.media_content_type), ("Game B", MediaType.GAME))
+        e, *_ = make({"power_state": "on", "title_id": "APOL00004"}, GAMES)
+        self.assertEqual((e.source, e.media_content_type), ("Apollo Save Tool", MediaType.APP))
         e, *_ = make({"power_state": "rest", "title_id": "CUSA90001"}, GAMES)
         self.assertIsNone(e.source)
 
     def test_select_source_launches(self):
         e, *_ = make({"power_state": "on"}, GAMES)
         run(e.async_select_source("Game B"))
-        self.assertEqual(LAUNCHES, ["CUSA90001"])
+        run(e.async_select_source("Spotify"))
+        self.assertEqual(LAUNCHES, ["CUSA90001", "CUSA90002"])
+        self.assertEqual(LAUNCHES_CLOSE_FIRST, [True, False])  # a game closes the running game, an app never
         with self.assertRaises(HomeAssistantError):
-            run(e.async_select_source("Spotify"))  # apps aren't in the list
-        self.assertEqual(LAUNCHES, ["CUSA90001"])
+            run(e.async_select_source("Library"))  # built-in apps aren't in the list
+        self.assertEqual(LAUNCHES, ["CUSA90001", "CUSA90002"])
 
-    def test_play_media_launches_games_only(self):
+    def test_play_media_launches_games_and_apps(self):
         e, *_ = make({"power_state": "on"}, GAMES)
         run(e.async_play_media(MediaType.GAME, "CUSA90004"))
-        self.assertEqual(LAUNCHES, ["CUSA90004"])
+        run(e.async_play_media(MediaType.APP, "apol00004"))
+        run(e.async_play_media(MediaType.GAME, "CUSA90002"))  # the app.db says app, whatever the type says
+        self.assertEqual(LAUNCHES, ["CUSA90004", "apol00004", "CUSA90002"])
+        self.assertEqual(LAUNCHES_CLOSE_FIRST, [True, False, False])
         with self.assertRaises(HomeAssistantError):
             run(e.async_play_media("music", "CUSA90004"))
-        self.assertEqual(LAUNCHES, ["CUSA90004"])
+        self.assertEqual(len(LAUNCHES), 3)
 
     def test_browse_root(self):
         e, *_ = make({}, GAMES)
         root = run(e.async_browse_media())
-        self.assertEqual([c.media_content_id for c in root.children], ["recent", "all"])
-        self.assertEqual([c.title for c in root.children], ["Recently played", "All games"])
+        self.assertEqual([c.media_content_id for c in root.children], ["recent", "all", "apps"])
+        self.assertEqual([c.title for c in root.children], ["Recently played", "All games", "Apps"])
         self.assertTrue(all(c.can_expand and not c.can_play for c in root.children))
 
-    def test_browse_recent_and_all(self):
+    def test_browse_recent_all_and_apps(self):
         e, *_ = make({}, GAMES)
         recent = run(e.async_browse_media("", "recent"))
-        self.assertEqual([c.media_content_id for c in recent.children], ["CUSA90003", "CUSA90004", "CUSA90001"])
+        self.assertEqual([c.media_content_id for c in recent.children],
+                         ["CUSA90003", "CUSA90002", "CUSA90004", "APOL00004", "CUSA90001"])
         all_games = run(e.async_browse_media("", "all"))
         self.assertEqual([c.title for c in all_games.children], ["Game A\u2122", "Game B", "Game C"])
+        apps = run(e.async_browse_media("", "apps"))
+        self.assertEqual([c.title for c in apps.children], ["Apollo Save Tool", "Spotify"])
+        self.assertEqual(apps.children_media_class, MediaClass.APP)
         tile = recent.children[0]
         self.assertEqual((tile.media_class, tile.media_content_type, tile.can_play), (MediaClass.GAME, MediaType.GAME, True))
         self.assertEqual(tile.thumbnail, "/api/media_player_proxy/media_player.ps4/browse_media/game/CUSA90003?token=t")
         self.assertEqual(recent.children_media_class, MediaClass.GAME)
+        app_tile = apps.children[0]
+        self.assertEqual((app_tile.media_class, app_tile.media_content_type, app_tile.can_play),
+                         (MediaClass.APP, MediaType.APP, True))
+        self.assertEqual(app_tile.thumbnail, "/api/media_player_proxy/media_player.ps4/browse_media/app/APOL00004?token=t")
 
     def test_browse_unknown_folder(self):
         e, *_ = make({}, GAMES)
         with self.assertRaises(BrowseError):
             run(e.async_browse_media("", "nope"))
 
+    def test_internet_browser_not_offered(self):  # built in: nowhere in the lists, and play_media refuses it
+        browser = {"NPXS20102": game("Internet Browser", "2026-10-16 09:00", ui="app", category="gdi")}
+        e, *_ = make({"power_state": "on"}, {**GAMES, **browser})
+        apps = run(e.async_browse_media("", "apps"))
+        self.assertEqual([c.title for c in apps.children], ["Apollo Save Tool", "Spotify"])
+        recent = run(e.async_browse_media("", "recent"))
+        self.assertNotIn("NPXS20102", [c.media_content_id for c in recent.children])
+        self.assertNotIn("Internet Browser", e.source_list)
+        with self.assertRaises(HomeAssistantError):
+            run(e.async_play_media(MediaType.APP, "npxs20102"))
+        with self.assertRaises(HomeAssistantError):
+            run(e.async_select_source("Internet Browser"))
+        self.assertEqual(LAUNCHES, [])
+
+    def test_browse_root_without_folders(self):  # no cache, or the user has none: no Folders entry
+        LAYOUT_CALLS.clear()
+        e, *_ = make({}, GAMES)
+        root = run(e.async_browse_media())
+        self.assertNotIn("folders", [c.media_content_id for c in root.children])
+        self.assertEqual(LAYOUT_CALLS, [("192.0.2.1", None)])  # nobody seen logging in yet
+
     def test_browse_image_is_console_icon(self):
         e, *_ = make({}, GAMES)
         self.assertEqual(run(e.async_get_browse_image("game", "CUSA90001")), (b"png:CUSA90001", "image/png"))
-        self.assertEqual(FTP_FETCHES, [("192.0.2.1", 2121, "CUSA90001", "/user/appmeta/CUSA90001/icon0.png")])
+        self.assertEqual(FTP_FETCHES, [("192.0.2.1", 2121, "E1", "CUSA90001", "/user/appmeta/CUSA90001/icon0.png")])
         self.assertEqual(run(e.async_get_browse_image("game", "CUSA00000")), (None, None))  # not on this console
         self.assertEqual(len(FTP_FETCHES), 1)
+
+    def test_panel_cover_urls(self):  # the Content tab: the media browser's tile URL, found through the entry data
+        e, entry_data, _ = make({}, GAMES)
+        self.assertNotIn("media_player_entity", entry_data)
+        run(e.async_added_to_hass())
+        self.assertIs(entry_data["media_player_entity"], e)
+        self.assertEqual(e.cover_url("CUSA90001"), "/api/media_player_proxy/media_player.ps4/browse_media/game/CUSA90001?token=t")
+        self.assertEqual(e.cover_url("APOL00004"), "/api/media_player_proxy/media_player.ps4/browse_media/app/APOL00004?token=t")
+        self.assertEqual(FTP_FETCHES, [], "a URL, no fetch")
+        run(e.async_will_remove_from_hass())
+        self.assertNotIn("media_player_entity", entry_data)
+
+
+FOLDERS = {
+    "folders": [
+        {"id": "000000002", "name": "Racing", "cover": "CUSA90001", "titles": ["CUSA90001", "CUSA90003"]},
+        {"id": "000000001", "name": "Apps", "cover": "APOL00004", "titles": ["CUSA90002", "APOL00004"]},
+    ],
+    "loose": ["CUSA90004", "CUSA77777"],  # CUSA77777: not in this console's game map → no tile
+}
+
+
+class BrowseFolderTests(unittest.TestCase):
+    """The logged-in user's home-screen folders (db.folder_layout) under "Folders"."""
+
+    def setUp(self):
+        LAYOUT.update(FOLDERS)
+        LAYOUT_CALLS.clear()
+
+    def tearDown(self):
+        LAYOUT.clear()
+
+    def test_root_has_folders_for_the_logged_in_user(self):
+        e, *_ = make({"login_user_id": "1c99f420"}, GAMES)
+        root = run(e.async_browse_media())
+        self.assertEqual([c.media_content_id for c in root.children], ["recent", "all", "apps", "folders"])
+        self.assertEqual(root.children[-1].title, "Folders")
+        self.assertEqual(LAYOUT_CALLS, [("192.0.2.1", 0x1C99F420)])
+
+    def test_folders_then_titles_outside_a_folder(self):
+        e, *_ = make({}, GAMES)
+        view = run(e.async_browse_media("", "folders"))
+        self.assertEqual([c.media_content_id for c in view.children],
+                         ["folder/000000002", "folder/000000001", "CUSA90004"])
+        self.assertEqual([c.title for c in view.children], ["Racing", "Apps", "Game A\u2122"])
+        racing, apps, game_a = view.children
+        self.assertEqual((racing.media_class, racing.can_expand, racing.can_play), (MediaClass.DIRECTORY, True, False))
+        url = "/api/media_player_proxy/media_player.ps4/browse_media/{}?token=t"
+        self.assertEqual(racing.thumbnail, url.format("game/CUSA90001"))  # the cover of the title the folder names
+        self.assertEqual(apps.thumbnail, url.format("app/APOL00004"))
+        self.assertEqual((racing.children_media_class, apps.children_media_class), (MediaClass.GAME, MediaClass.APP))
+        self.assertEqual((game_a.media_class, game_a.can_play), (MediaClass.GAME, True))
+
+    def test_folder_in_the_consoles_order(self):
+        e, *_ = make({}, GAMES)
+        apps = run(e.async_browse_media("", "folder/000000001"))
+        self.assertEqual(apps.title, "Apps")
+        self.assertEqual([c.title for c in apps.children], ["Spotify", "Apollo Save Tool"])
+        self.assertTrue(all(c.media_class == MediaClass.APP and c.can_play for c in apps.children))
+        racing = run(e.async_browse_media("", "folder/000000002"))
+        self.assertEqual([c.media_content_id for c in racing.children], ["CUSA90001", "CUSA90003"])
+
+    def test_unknown_folder(self):  # e.g. another user logged in since the view was opened
+        e, *_ = make({}, GAMES)
+        with self.assertRaises(BrowseError):
+            run(e.async_browse_media("", "folder/000000009"))
 
 
 if __name__ == "__main__":

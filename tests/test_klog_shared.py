@@ -93,7 +93,8 @@ class ListenerTests(unittest.IsolatedAsyncioTestCase):
     async def test_cancellation_cleanup_and_raw_stream(self):
         import contextlib
         disp=Dispatcher()
-        sm=SimpleNamespace(klog_connected=False,on_klog_connected=lambda now:None,tick=lambda now:False)
+        sm=SimpleNamespace(klog_connected=False,on_klog_connected=lambda now:None,tick=lambda now:False,
+                       on_klog_heard=lambda:False)
         data={'klog_state_machine':sm,'klog_data':{'klog_connected':False}}
         hass=SimpleNamespace(data={DOMAIN:{'one':data}},bus=Bus(),loop=asyncio.get_running_loop())
         coordinator=SimpleNamespace(data={},async_set_updated_data=lambda d:None)

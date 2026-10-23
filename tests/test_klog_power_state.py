@@ -22,7 +22,8 @@ def load_state_machine():
     keep = []
     for node in ast.parse(INIT.read_text()).body:
         if isinstance(node, ast.Assign) and all(
-            isinstance(t, ast.Name) and t.id.startswith(("_KLOG_", "_SYSTEM_STATE", "_REST_", "_HOME_SCREEN", "_TITLE_ID"))
+            isinstance(t, ast.Name)
+            and t.id.startswith(("_KLOG_", "_SYSTEM_STATE", "_REST_", "_FROZEN_", "_HOME_SCREEN", "_TITLE_ID"))
             for t in node.targets
         ):
             keep.append(node)
@@ -57,6 +58,20 @@ IDLE = "<118>[SceSystemStateMgr] No user input for 60 seconds"
 DEEP_REST = "<118>[SceSystemStateMgr] State Change: SUSPEND_ON_GOING"
 POWER_MODE = "<118>[SceSystemStateMgr] Power Mode Change: NAVIGATION"
 SHUTDOWN = "<118>[SceSystemStateMgr] State Change: SHUTDOWN_ON_GOING"
+# rest from a game, in the console's order: the power-mode line comes in the same second as the state change, the
+# first heartbeat ~13 s later
+REST_FROM_GAME = [
+    "<118>[SceSystemStateMgr] No user input for 180 seconds",
+    "<118>[SceSystemStateMgr] Enter Standby Mode Request from ShellUI",
+    "<118>[SceSystemStateMgr] State Change: MAIN_ON_STANDBY",
+    "<118>[SceSystemStateMgr] Trigger Code: MISC",
+    "<118>[SceSystemStateMgr] Power Mode Change: NAVIGATION",
+    "<118>[SL] AppFocusChanged [CUSA90007] -> [invalid_title]",
+    "<118>[SceLncService] Num. of logged-in users is 1",
+    "<118>[SL] AppFocusChanged [invalid_title] -> [NPXS20001]",
+    "<118>[SceSystemStateMgr] Keeping MAIN_ON_STANDBY (BGFT 0, SaveData 8, Update 0, BgDailyChecker 0, EventService 0, PatchChecker 0, vshUpdate 0, appInstaller 0)",
+    "<118>[SceSystemStateMgr] State Change: SUSPEND_ON_GOING",
+]
 
 
 def feed(sm, lines):
@@ -103,9 +118,37 @@ class PowerStateTests(unittest.TestCase):
         self.assertEqual(self.sm.power_state, "rest")
         self.assertFalse(self.sm.ingest(KEEPING))  # repeat every 60 s: no change event
 
-    def test_power_mode_change_means_on(self):
-        feed(self.sm, ENTER_REST)
-        feed(self.sm, [POWER_MODE])
+    def test_power_mode_change_means_on(self):  # HA joins a running console
+        self.assertTrue(self.sm.ingest(POWER_MODE))
+        self.assertEqual(self.sm.power_state, "on")
+
+    def test_rest_from_a_game_stays_rest(self):
+        feed(self.sm, WAKE + [GAME_FOCUS])
+        rest_at = REST_FROM_GAME.index("<118>[SceSystemStateMgr] State Change: MAIN_ON_STANDBY")
+        for i, line in enumerate(REST_FROM_GAME):
+            self.sm.ingest(line)
+            with self.subTest(line=line):
+                self.assertEqual(self.sm.power_state, "on" if i < rest_at else "rest")
+        self.assertIsNone(self.sm.current_title_id)
+        self.assertEqual(self.sm.last_reason, "state_change_main_on_standby")
+
+    def test_power_mode_change_after_a_reconnect_means_on(self):  # wake from deep rest: klog joins after WORKING
+        feed(self.sm, ENTER_REST + [DEEP_REST])
+        self.sm.on_klog_connected(100.0)
+        self.assertTrue(self.sm.ingest(POWER_MODE))
+        self.assertEqual(self.sm.power_state, "on")
+
+    def test_power_mode_change_after_a_restored_rest_means_on(self):  # HA restarted during rest, then a wake
+        sm = KlogStateMachine()
+        sm.restore_power_state("rest")
+        sm.on_klog_connected(0.0)
+        self.assertTrue(sm.ingest(POWER_MODE))
+        self.assertEqual(sm.power_state, "on")
+
+    def test_wake_on_the_same_connection_means_on(self):
+        feed(self.sm, REST_FROM_GAME[:5] + WAKE)
+        self.assertEqual(self.sm.power_state, "on")
+        self.assertFalse(self.sm.ingest(POWER_MODE))
         self.assertEqual(self.sm.power_state, "on")
 
     def test_game_focus_means_on_even_if_working_line_missed(self):
@@ -173,6 +216,18 @@ class ChooseUserScreenTests(unittest.TestCase):
         feed(self.sm, self.WELCOME + ENTER_REST)
         self.assertFalse(self.sm.no_user_logged_in)
 
+    def test_login_user_kept_through_rest(self):  # the media browser shows this user's folders
+        feed(self.sm, self.WELCOME)
+        self.assertIsNone(self.sm.snapshot()["login_user_id"])  # ffffffff = nobody
+        feed(self.sm, [self.RP_LOGIN] + ENTER_REST + self.WELCOME)
+        self.assertEqual(self.sm.snapshot()["login_user_id"], "10000001")
+
+    def test_other_user_login_is_a_change(self):
+        feed(self.sm, self.WELCOME + [self.RP_LOGIN])
+        self.assertTrue(self.sm.ingest("<118>[Theme/I] : OnLogin : 1C99F420"))
+        self.assertEqual(self.sm.login_user_id, "1c99f420")
+        self.assertFalse(self.sm.ingest("<118>[Theme/I] : OnLogin : 1c99f420"))
+
 
 class HeartbeatGraceTests(unittest.TestCase):
     """Wake from deep rest: 'State Change: WORKING' can be emitted before klog reconnects."""
@@ -207,6 +262,85 @@ class HeartbeatGraceTests(unittest.TestCase):
 
     def test_grace_covers_the_60s_heartbeat(self):
         self.assertGreater(GRACE, 60)
+
+
+class NotRespondingTests(unittest.TestCase):
+    """On, klog silent, no DDP reply (the caller's checks are a minute apart): frozen."""
+
+    def setUp(self):
+        self.sm = KlogStateMachine()
+        self.sm.klog_connected = True
+        self.sm.on_klog_connected(0.0)
+        feed(self.sm, WAKE + [GAME_FOCUS])
+
+    def flag(self):
+        self.sm.on_ddp_silence_check(None)
+        self.assertTrue(self.sm.on_ddp_silence_check(None))
+
+    def test_two_misses_in_a_row(self):
+        self.assertFalse(self.sm.on_ddp_silence_check(None))
+        self.assertFalse(self.sm.snapshot()["not_responding"])
+        self.assertTrue(self.sm.on_ddp_silence_check(None))
+        snap = self.sm.snapshot()
+        self.assertTrue(snap["not_responding"])
+        self.assertEqual(snap["power_state"], "on")
+        self.assertEqual(snap["state_reason"], "ddp_silent_klog_silent")
+        self.assertFalse(self.sm.on_ddp_silence_check(None))  # already flagged: no change event
+
+    def test_a_reply_between_misses_starts_over(self):
+        for code in (None, 200, None):
+            self.sm.on_ddp_silence_check(code)
+        self.assertFalse(self.sm.not_responding)
+
+    def test_klog_between_misses_starts_over(self):
+        self.sm.on_ddp_silence_check(None)
+        self.assertFalse(self.sm.on_klog_heard())
+        self.assertFalse(self.sm.on_ddp_silence_check(None))
+        self.assertFalse(self.sm.not_responding)
+
+    def test_a_reply_clears_it(self):
+        self.flag()
+        self.assertTrue(self.sm.on_ddp_silence_check(200))
+        self.assertFalse(self.sm.not_responding)
+        self.assertFalse(self.sm.on_ddp_silence_check(200))
+
+    def test_klog_data_clears_it(self):
+        self.flag()
+        self.assertTrue(self.sm.on_klog_heard())
+        self.assertFalse(self.sm.not_responding)
+        self.assertFalse(self.sm.on_klog_heard())
+
+    def test_a_reconnect_clears_it(self):
+        self.flag()
+        self.sm.on_klog_connected(500.0)
+        self.assertFalse(self.sm.not_responding)
+
+    def test_ddp_standby_means_rest(self):
+        self.assertTrue(self.sm.on_ddp_silence_check(620))
+        self.assertEqual(self.sm.power_state, "rest")
+        self.assertIsNone(self.sm.current_title_id)
+        self.assertFalse(self.sm.not_responding)
+
+    def test_rest_or_off_clears_it(self):
+        for lines in (ENTER_REST, [SHUTDOWN]):
+            with self.subTest(lines=lines[0]):
+                self.setUp()
+                self.flag()
+                feed(self.sm, lines)
+                self.assertFalse(self.sm.not_responding)
+                self.assertNotEqual(self.sm.power_state, "on")
+
+    def test_only_while_on(self):
+        for power_lines in (ENTER_REST, [SHUTDOWN]):
+            with self.subTest(lines=power_lines[0]):
+                sm = KlogStateMachine()
+                feed(sm, power_lines)
+                self.assertFalse(sm.on_ddp_silence_check(None))
+                self.assertFalse(sm.on_ddp_silence_check(None))
+                self.assertFalse(sm.not_responding)
+        sm = KlogStateMachine()  # unknown
+        sm.on_ddp_silence_check(None)
+        self.assertFalse(sm.on_ddp_silence_check(None))
 
 
 class UnreachableTests(unittest.TestCase):

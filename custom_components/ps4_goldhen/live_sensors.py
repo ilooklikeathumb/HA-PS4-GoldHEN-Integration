@@ -19,7 +19,8 @@ A newer copy replaces a running one (run file on the console), so a spare send i
 
 The payload writes its line to /dev/console, which klog delivers within a second. Its fallback,
 klog_puts, is held until something else logs: up to 34 s in a game, 5 min 03 s on the idle home screen. So a reading
-counts as current for 10 min, after which the sensors show unavailable.
+counts as current for 10 min, after which the sensors show unavailable. A line that lacks a field (or carries it out of
+range) makes that one sensor unavailable until a line has it again; the others stay.
 
 How others do it: PS5 exporters and overlays read the same libkernel calls (Marice/ps5-exporter,
 drakmor/fan_target, onionHEN); Itemzflow reads the CPU temperature on PS4. A GoldHEN plugin can't: it only runs inside
@@ -156,13 +157,16 @@ def is_enabled(hass: HomeAssistant, entry_id: str) -> bool:
     return bool(state and state["enabled"])
 
 
-def is_live(hass: HomeAssistant, entry_id: str) -> bool:
-    """The switch is on, the console is on and the last reading is under FRESH_FOR old."""
+def is_live(hass: HomeAssistant, entry_id: str, key: str | None = None) -> bool:
+    """The switch is on, the console is on and the last reading is under FRESH_FOR old; with `key`, that last reading
+    also had this sensor's field."""
     state = _state(hass, entry_id)
     if not state or not state["enabled"] or state["last_reading"] is None:
         return False
     data = hass.data[DOMAIN][entry_id]
     if (data["coordinator"].data or {}).get("power_state") != POWER_ON:
+        return False
+    if key is not None and data["klog_data"].get(key) is None:
         return False
     return _now(hass) - state["last_reading"] < FRESH_FOR
 
@@ -214,7 +218,7 @@ def async_handle_line(hass: HomeAssistant, entry_id: str, line: str) -> bool:
     new = readings(values)
     if new:
         state["last_reading"] = now
-        data["klog_data"].update(new)
+        data["klog_data"].update({**dict.fromkeys(SENSOR_KEYS), **new})  # a field this line lacks has no current value
         _push(data)
         if "thr" in values and (entry := hass.config_entries.async_get_entry(entry_id)) is not None:
             fan.async_check(hass, entry, values["thr"], now)

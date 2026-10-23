@@ -43,6 +43,7 @@ _HOME_SCREEN_STATE = HOME_SCREEN
 _IDLE_STATE        = "Idle"
 _REST_MODE_STATE   = "Rest Mode"
 _OFF_STATE         = "Off"
+_NOT_RESPONDING_STATE = "Not responding"
 
 # optional: if an entity with this ID exists, its `rest` / `offline` state overrides
 _PI_STATE_SENSOR = "sensor.ps4_state_pi"
@@ -52,6 +53,7 @@ STATUS_PLAYING     = "playing"
 STATUS_HOME_SCREEN = "home_screen"
 STATUS_REST        = "rest"
 STATUS_OFF         = "off"
+STATUS_NOT_RESPONDING = "not_responding"
 
 # the PS4State plugin (PS4StateJSON.prx) isn't working yet, so its sensors are created
 # disabled. Flip to True once a working plugin publishes ps4_state.json.
@@ -175,13 +177,16 @@ class PS4CurrentGameSensor(CoordinatorEntity, RestoreEntity, SensorEntity):
         return tid
 
     def _power_class(self) -> str | None:
-        """"rest" / "off" when the console isn't running, else None."""
+        """"rest" / "off" when the console isn't running, "not_responding" when it's on but silent, else None."""
         pi = (self._pi_state or "").strip().lower()
-        power = (self.coordinator.data or {}).get("power_state")  # from klog
+        data = self.coordinator.data or {}
+        power = data.get("power_state")  # from klog
         if pi == "rest" or power == POWER_REST:
             return "rest"
         if pi == "offline" or power == POWER_OFF:
             return "off"
+        if data.get("not_responding"):
+            return "not_responding"
         return None
 
     @property
@@ -191,6 +196,8 @@ class PS4CurrentGameSensor(CoordinatorEntity, RestoreEntity, SensorEntity):
             return _REST_MODE_STATE
         if power == "off":
             return _OFF_STATE
+        if power == "not_responding":
+            return _NOT_RESPONDING_STATE
         return self._ps4_state()
 
     @property
@@ -198,16 +205,9 @@ class PS4CurrentGameSensor(CoordinatorEntity, RestoreEntity, SensorEntity):
         data      = self.coordinator.data or {}
         val       = self.native_value
         tid       = data.get(SENSOR_TITLE_ID)
-        game_map  = (
-            self.hass.data.get(DOMAIN, {})
-            .get(self._entry_id, {})
-            .get("game_map", {})
-        )
-        game_info = game_map.get(tid, {}) if tid else {}
         return {
             SENSOR_TITLE_ID:    tid,
             SENSOR_GAME_NAME:   data.get(SENSOR_GAME_NAME),
-            "cdn_cover":        game_info.get("cdn_cover"),
             # dashboards + automations read this, not the state text
             "state_classification": (
                 self._power_class()
@@ -239,7 +239,7 @@ def _restore_power(entity, power: str | None) -> None:
 
 
 class PS4StatusSensor(CoordinatorEntity, RestoreEntity, SensorEntity):
-    """What the console is doing: Playing / Home screen / Rest mode / Off.
+    """What the console is doing: Playing / Home screen / Rest mode / Off / Not responding.
 
     Same source and rules as media_player.ps4 (klog power state + running title), but keeps rest and off apart,
     which the media player can't (HA deprecated STANDBY). Automations use the keys; the shown words come from
@@ -249,7 +249,7 @@ class PS4StatusSensor(CoordinatorEntity, RestoreEntity, SensorEntity):
     _attr_has_entity_name = True
     _attr_translation_key = "status"
     _attr_device_class = SensorDeviceClass.ENUM
-    _attr_options = [STATUS_PLAYING, STATUS_HOME_SCREEN, STATUS_REST, STATUS_OFF]
+    _attr_options = [STATUS_PLAYING, STATUS_HOME_SCREEN, STATUS_REST, STATUS_OFF, STATUS_NOT_RESPONDING]
 
     def __init__(self, coordinator, entry: ConfigEntry) -> None:
         super().__init__(coordinator)
@@ -271,6 +271,8 @@ class PS4StatusSensor(CoordinatorEntity, RestoreEntity, SensorEntity):
             return STATUS_REST
         if power == POWER_OFF:
             return STATUS_OFF
+        if data.get("not_responding"):  # on, but klog silent and no DDP reply: frozen
+            return STATUS_NOT_RESPONDING
         if data.get(SENSOR_TITLE_ID):
             return STATUS_PLAYING
         if power == POWER_ON:
@@ -294,8 +296,8 @@ class PS4CPUTempSensor(CoordinatorEntity, SensorEntity):
 
     @property
     def available(self) -> bool:
-        # no current reading (switch off, console not on, nothing for 10 min) → unavailable
-        return super().available and live_sensors.is_live(self.hass, self._entry_id)
+        # no current reading (switch off, console not on, nothing for 10 min, the last line lacked it) → unavailable
+        return super().available and live_sensors.is_live(self.hass, self._entry_id, SENSOR_CPU_TEMP)
 
     @property
     def native_value(self) -> float | None:
@@ -320,7 +322,7 @@ class PS4SoCTempSensor(CoordinatorEntity, SensorEntity):
 
     @property
     def available(self) -> bool:
-        return super().available and live_sensors.is_live(self.hass, self._entry_id)
+        return super().available and live_sensors.is_live(self.hass, self._entry_id, SENSOR_SOC_TEMP)
 
     @property
     def native_value(self) -> float | None:
@@ -420,7 +422,7 @@ class PS4FanDutySensor(CoordinatorEntity, SensorEntity):
 
     @property
     def available(self) -> bool:
-        return super().available and live_sensors.is_live(self.hass, self._entry_id)
+        return super().available and live_sensors.is_live(self.hass, self._entry_id, SENSOR_FAN_DUTY)
 
     @property
     def native_value(self) -> int | None:

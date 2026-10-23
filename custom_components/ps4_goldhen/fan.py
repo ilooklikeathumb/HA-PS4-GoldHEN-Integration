@@ -6,7 +6,8 @@ curve and no RPM on a PS4 (the kernel reports duty only). The community calls it
 
 - **Fan control off** (the default) = the console's own target, its factory value unless another tool changed it. Turning
   it off sends back what the console held before Fan control took over (`before`, kept in .storage), once; in rest /
-  off that waits until the console reports in. `before` is what the console reported when Fan control went on, or the
+  off, or after a send that failed, that waits until the console reports in (`restore_to`, also kept in .storage, so an
+  HA restart in between doesn't lose it). `before` is what the console reported when Fan control went on, or the
   `was` of HA's first send after that. Unknown = HA never changed the target, so Off sends nothing.
   Off never sends a fixed 83: only the CUH-72xx Pros ship with 83, the others with 78-80, so a fixed 83 would leave
   them hotter than stock until unplugged. Factory values per model: xalfie's table,
@@ -99,7 +100,7 @@ def init_state(data: dict[str, Any]) -> None:
         "enabled": False,          # the Fan control switch
         "wanted": None,            # the slider; None = the model's factory target
         "before": None,            # the console's own target from before Fan control took over (.storage)
-        "restore_to": None,        # what a pending Off sends
+        "restore_to": None,        # what a pending Off sends (.storage while pending)
         "restore_pending": False,  # switched off while `restore_to` couldn't be sent yet
         "store": None,
         "last_auto": None,         # loop time of the last automatic send
@@ -113,22 +114,30 @@ def _store(hass: HomeAssistant, entry: ConfigEntry) -> Store:
 
 
 async def async_load(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """`before` from .storage, so an HA restart while Fan control is on still knows what Off goes back to."""
+    """`before` and a pending Off's `restore_to` from .storage, so an HA restart while Fan control is on, or before an
+    Off reached the console, still knows what the console goes back to."""
     fan = hass.data[DOMAIN][entry.entry_id]["fan"]
     fan["store"] = _store(hass, entry)
     saved = await fan["store"].async_load()
-    value = saved.get("before") if isinstance(saved, dict) else None
-    fan["before"] = value if isinstance(value, int) and 1 <= value <= 124 else None
+    saved = saved if isinstance(saved, dict) else {}
+    fan["before"] = _target(saved.get("before"))
+    fan["restore_to"] = _target(saved.get("restore_to"))
+    fan["restore_pending"] = fan["restore_to"] is not None
+
+
+def _target(value: Any) -> int | None:
+    return value if isinstance(value, int) and 1 <= value <= 124 else None
 
 
 async def async_remove(hass: HomeAssistant, entry: ConfigEntry) -> None:
     await _store(hass, entry).async_remove()
 
 
-def _set_before(fan: dict[str, Any], value: int | None) -> None:
-    fan["before"] = value
+def _save(fan: dict[str, Any]) -> None:
+    """`before`, and what a pending Off still owes the console, to .storage."""
     if fan["store"] is not None:
-        fan["store"].async_delay_save(lambda: {"before": fan["before"]}, 1)
+        fan["store"].async_delay_save(
+            lambda: {"before": fan["before"], "restore_to": fan["restore_to"] if fan["restore_pending"] else None}, 1)
 
 
 def off_value(hass: HomeAssistant, entry_id: str) -> int | None:
@@ -202,10 +211,12 @@ def async_handle_line(hass: HomeAssistant, entry_id: str, line: str) -> bool:
         coordinator.async_set_updated_data({**(coordinator.data or {}), **data["klog_data"]})
     fan = data["fan"]
     if values.get("state") == "set":
-        if not fan["enabled"] and values.get("thr") == fan["restore_to"]:
+        if not fan["enabled"] and fan["restore_pending"] and values.get("thr") == fan["restore_to"]:
             fan["restore_pending"] = False
+            _save(fan)
         if fan["enabled"] and fan["before"] is None and "was" in values:
-            _set_before(fan, values["was"])  # Fan control went on in rest / off: the first send tells
+            fan["before"] = values["was"]  # Fan control went on in rest / off: the first send tells
+            _save(fan)
     waiter = fan["waiter"]
     if waiter is not None and not waiter.done():
         waiter.set_result(values)
@@ -270,21 +281,25 @@ async def async_set_enabled(hass: HomeAssistant, entry: ConfigEntry, enabled: bo
         return
     if enabled:
         if fan["restore_pending"]:  # the last Off never reached the console: it still holds HA's value
-            _set_before(fan, fan["restore_to"])
+            fan["before"] = fan["restore_to"]
         fan["restore_pending"] = False
         if fan["before"] is None and (held := console_value(hass, entry.entry_id)) is not None:
-            _set_before(fan, held)
+            fan["before"] = held
+        _save(fan)
         target = wanted(hass, entry.entry_id)
     else:
         target = fan["restore_to"] = fan["before"]
-        _set_before(fan, None)
+        fan["before"] = None
         fan["restore_pending"] = target is not None
+        _save(fan)  # owed until it lands: a failed send or an HA restart keeps it
         if target is None:
             return  # HA never changed the console's own target
     if _on(data):
         if console_value(hass, entry.entry_id) != target:
             await async_set_threshold(hass, entry, target)
-        fan["restore_pending"] = False
+        if fan["restore_pending"]:
+            fan["restore_pending"] = False
+            _save(fan)
 
 
 @callback
@@ -299,6 +314,7 @@ def async_check(hass: HomeAssistant, entry: ConfigEntry, held: int, now: float) 
     elif fan["restore_pending"]:
         if held == fan["restore_to"]:
             fan["restore_pending"] = False
+            _save(fan)
             return
         target = fan["restore_to"]
     else:

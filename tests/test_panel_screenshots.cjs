@@ -26,6 +26,7 @@ const shots = [
 ];
 
 let importResult = () => ({in_ha: true});
+let listResult = (msg) => ({shots: shots.slice(msg.offset, msg.offset + msg.count), more: false});
 
 function panel(settings) {
   const calls = [];
@@ -39,7 +40,7 @@ function panel(settings) {
       }
       if (msg.type === 'ps4_goldhen/screenshots/get') return settings;
       if (msg.type === 'ps4_goldhen/screenshots/set') return Object.assign(settings, msg);
-      if (msg.type === 'ps4_goldhen/screenshots/list') return {shots: shots.slice(msg.offset, msg.offset + msg.count), more: false};
+      if (msg.type === 'ps4_goldhen/screenshots/list') return listResult(msg);
       if (msg.type === 'ps4_goldhen/screenshots/sync') return {started: true, total: (msg.rels || []).length};
       if (msg.type === 'ps4_goldhen/screenshots/delete') return {ha_deleted: msg.ha ? 1 : 0, ps4_deleted: msg.ps4 ? msg.rels.length : 0};
       if (msg.type === 'ps4_goldhen/screenshots/import') return importResult(msg);
@@ -280,6 +281,58 @@ async function main() {
     p.narrow = true;
     assert.match(p.shadowRoot.innerHTML, /id="btn-menu"/);
     console.log('PASS: errors inline (no alert); menu button when narrow');
+  }
+
+  // Rest mode / off: HA's last read, no PS4 actions (Refresh, Sync all, Sync N, PS4 delete, viewer Sync)
+  {
+    const READ_AT = '2026-10-15T22:00:00+00:00';
+    listResult = (msg) => ({shots: shots.slice(msg.offset, msg.offset + msg.count), more: false,
+      asleep: true, power_state: 'rest', read_at: READ_AT});
+    const {p, calls} = panel({...SETTINGS_ON, power_state: 'rest'});
+    await p._loadEntries();
+    p._tab = 'screenshots';
+    await p._ssLoad();
+    let html = p.shadowRoot.innerHTML;
+    assert.match(html, /The PS4 is in rest mode: this is what HA read [^<]*\d[^<]*\./, 'the read time (locale format)');
+    assert.doesNotMatch(html, /Reading the PS4/);
+    assert.match(html, /id="ss-sync" disabled>Sync all\.\.\.</);
+    assert.match(html, /id="ss-refresh" disabled>Refresh</);
+    assert.match(html, /id="ss-select">Select</, 'Select stays: HA copies can still be deleted');
+    assert.match(html, /<span class="ss-game">Home screen<\/span>/, 'the last read shows');
+    p._ssSelecting = true;
+    p._ssSelected = new Set([HOME, GAME_D]);
+    p._render();
+    html = p.shadowRoot.innerHTML;
+    assert.match(html, /id="ss-copy-selected" disabled>Sync 1 to HA</);
+    assert.match(html, /id="ss-delete" >Delete 2\.\.\.</);
+    p._ssOpenDelete();
+    const dlg = p._renderSsDelete();
+    assert.match(dlg, /<input type="checkbox" disabled> PS4 original \(the PS4 is in rest mode or off\)/);
+    assert.doesNotMatch(dlg, /id="ss-del-ps4"/);
+    p._ssDelete = null;
+    p._ssSelecting = false;
+    await p._ssCardClick(GAME_D);
+    assert.match(p._renderSsView(), /id="ss-view-sync" disabled>Sync to HA</);
+    p._ssView = null;
+
+    // Off, nothing read since HA started: says to turn it on, not "No screenshots"
+    listResult = () => ({shots: [], more: false, asleep: true, power_state: 'off', read_at: null});
+    await p._ssLoadShots(true);
+    html = p.shadowRoot.innerHTML;
+    assert.match(html, /The PS4 is off: turn it on to see its screenshots\./);
+    assert.doesNotMatch(html, /No screenshots on this PS4 yet/);
+    assert.equal(calls.filter((c) => c.type === 'ps4_goldhen/screenshots/plan').length, 0);
+
+    // On again: the buttons come back, the line goes
+    listResult = (msg) => ({shots: shots.slice(msg.offset, msg.offset + msg.count), more: false,
+      asleep: false, power_state: 'on', read_at: READ_AT});
+    await p._ssLoadShots(true);
+    html = p.shadowRoot.innerHTML;
+    assert.doesNotMatch(html, /The PS4 is (in rest mode|off)/);
+    assert.match(html, /id="ss-sync" >Sync all\.\.\.</);
+    assert.match(html, /id="ss-refresh" >Refresh</);
+    listResult = (msg) => ({shots: shots.slice(msg.offset, msg.offset + msg.count), more: false});
+    console.log('PASS: asleep = last read + its time, PS4 actions greyed, HA deletes still allowed');
   }
 
   // Console clock shown as is

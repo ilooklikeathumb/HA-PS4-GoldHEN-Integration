@@ -8,13 +8,12 @@ Tech-Morph's 0.9.0: [CHANGELOG](CHANGELOG.md).
 | Port | Service | Used for | Rule |
 |---|---|---|---|
 | TCP 3232 | GoldHEN klog | One long-lived connection per console. Almost all state comes from it. | One client at a time. Never close it on a timer. |
-| TCP 2121 | GoldHEN FTP | app.db (game list), covers, screenshots, saves, the panel's FTP tab | HA uses one session at a time (a precaution). Never poll. |
+| TCP 2121 | GoldHEN FTP | app.db (games + apps list), covers, screenshots, saves, the panel's FTP tab | HA uses one session at a time (a precaution). Never poll. |
 | TCP 9090 | GoldHEN BinLoader | Payload sends | Connect only to send a real payload. |
 | UDP 987 | Sony DDP | Status (on / rest), firmware, MAC, running title; wake from rest | Answers in rest too, no GoldHEN needed. |
 | UDP + TCP 9295 | Sony Remote Play | Pairing; signing the paired user in after a wake | No video stream is ever opened. |
 
-Nothing else leaves the LAN, apart from game covers that app.db lists as a Sony CDN URL (fetched by HA's own picture
-proxy).
+Nothing leaves the LAN: game covers are the console's own icons (`/user/appmeta/<title ID>/icon0.png` over FTP).
 
 ## Where the state comes from
 
@@ -23,11 +22,13 @@ klog 3232 ─► _klog_listener_task ─┬─► console_info / live_sensors   
                                   ├─► signal_klog_line(entry)       (panel Klog tab only)
                                   └─► KlogStateMachine ─► coordinator data ─► media player, Status, Current game
                                                                           └─► game_session ─► play_time, save_backup
-DDP 987 (setup, each klog connect, stale check) ─► KlogStateMachine
+DDP 987 (setup, each klog connect, stale + frozen checks) ─► KlogStateMachine
 ```
 
 - **`KlogStateMachine`** (`__init__.py`) reads power from SceSystemStateMgr lines (`State Change`, the
-  `Keeping MAIN_ON_STANDBY` line rest logs every 60 s, `Power Mode Change`), the game in focus from
+  `Keeping MAIN_ON_STANDBY` line rest logs every 60 s, `Power Mode Change`; entering rest logs one of those right
+  after `State Change: MAIN_ON_STANDBY`, so it only means on when rest / off wasn't seen on this connection), the game
+  in focus from
   `[SL] AppFocusChanged`, launches and closes from the launch / BGFT / `Game Close detected` lines, and the
   choose-user screen from `[UserSelectScene]` and the logged-in user count. A game that loses focus without a close line is kept as `suspended_title_id`.
 - **Power without a line:** klog connected for 90 s without a rest heartbeat = on. A connect that fails with
@@ -36,6 +37,11 @@ DDP 987 (setup, each klog connect, stale check) ─► KlogStateMachine
   if klog has no game yet, the running title (`running-app-titleid`). It never overrides what klog saw. While the
   state says rest / off and klog has been silent for 60 s, one search a minute checks for a stale socket (a wake from
   deep rest that HA didn't see): `200` closes the socket and reconnects after 1 s.
+- **Not responding.** While the state says on and klog has been silent for 5 minutes, the same search runs once a
+  minute. A frozen console keeps the socket open (keepalives answered) but sends nothing and doesn't answer DDP: two
+  no-replies in a row set `not_responding` (Status Not responding, media player unknown, no game in focus for play
+  time). Klog data, a DDP reply, a new klog connection or rest / off clear it; `620` sets rest. A DDP send error
+  (HA's own network) is neither a reply nor a miss.
 - **No polling.** The listener pushes data with `coordinator.async_set_updated_data`. The coordinator's FTP poll
   (upstream's telemetry for its unfinished PS4StateJSON plugin) is off (`_FTP_TELEMETRY_ENABLED = False`).
 - **Payload lines** (`ps4_goldhen console-info:`, `ps4_goldhen sensors:`, `ps4_goldhen fan:`) are claimed by
@@ -46,12 +52,12 @@ DDP 987 (setup, each klog connect, stale check) ─► KlogStateMachine
 
 | File | Job |
 |---|---|
-| `__init__.py` | Entry setup / unload, klog listener + `KlogStateMachine`, app.db refresh task, panel + static paths, FTP download / upload views, `send_payload` service |
+| `__init__.py` | Entry setup / unload, klog listener + `KlogStateMachine`, app.db refresh task, panel + static paths, FTP download / upload views, `send_payload` + `close_title` services |
 | `config_flow.py` | Setup (host, FTP check), wake / pair menu, options (connection and wake settings, pairing), DHCP IP follow |
 | `entity.py` | One device per config entry |
-| `media_player.py` | State, game + cover, turn on (DDP wake or wake entity, then sign-in), turn off (rest), game list + launch |
+| `media_player.py` | State, game + cover, turn on (DDP wake or wake entity, then sign-in), turn off (rest), games + apps list + launch |
 | `sensor.py` | Status, Current game, FTP status, play time sensors, temperatures, the disabled plugin sensors |
-| `image.py`, `button.py`, `switch.py`, `number.py` | Game cover; Rest mode, Read console info, Close game; Live temperatures, Fan control; Fan target temperature |
+| `image.py`, `button.py`, `switch.py`, `number.py` | Game cover; Rest mode, Read console info, Close application; Live temperatures, Fan control; Fan target temperature |
 | `ddp.py` | DDP `SRCH` (status, firmware, MAC, title) and `WAKEUP` |
 | `rest.py` | Rest mode + `async_payload_preflight`, the checks before any of the integration's own payloads |
 | `launch.py` | Launch / close / resume through the launch payload |
@@ -61,11 +67,12 @@ DDP 987 (setup, each klog connect, stale check) ─► KlogStateMachine
 | `screenshots.py`, `screenshot_entities.py`, `capture_files.py` | Screenshots: settings, sync, viewer, delete; device-page entities; console layout + FTP walk |
 | `save_backup.py`, `save_backup_entities.py`, `save_files.py` | Save backup: settings, passes, send to PS4, zips, delete; entities; console + HA layouts |
 | `rp_regist.py`, `rp_session.py`, `rp_keys.py` | Remote Play pairing with a PIN, the sign-in session, the key tables (ported from playactor, see [CREDITS](../CREDITS.md)) |
-| `db.py` | app.db pull, per-console cache, game map + game list |
+| `db.py` | app.db pull, per-console cache, game map + title list (games and installed apps) |
 | `ftp_session.py`, `ftp_listing.py`, `payload_target.py`, `dynamic_entities.py` | Per-console FTP lock; MLSD / LIST listings; which console a `send_payload` call goes to; entities that come and go with a setting |
 | `websocket.py` | FTP tab commands, Klog tab subscription |
 | `ftp_telemetry.py` | Upstream's telemetry poll for its PS4State plugin (unfinished); off |
-| `frontend/ps4-goldhen-panel.js` | The sidebar panel (FTP, Payloads, Klog, Saves, Screenshots, Play time) |
+| `games.py` | Content tab commands: the cover list and one game's page (reads what the modules above hold, no PS4 call) |
+| `frontend/ps4-goldhen-panel.js` | The sidebar panel (Content, Saves, Screenshots, Play time, FTP, Payloads, Klog) |
 | `*_payload/` | The integration's own ELFs, each with a README (source, SHA256, license) |
 | `bundled_payloads/` | Third-party payloads from upstream, copied to `/config/ps4/payloads` |
 
@@ -74,7 +81,7 @@ DDP 987 (setup, each klog connect, stale check) ─► KlogStateMachine
 | ELF | Does | HA knows it worked from |
 |---|---|---|
 | `rest_payload/rest-mode.elf` | `sceSystemStateMgrEnterStandby` (Power → Enter Rest Mode) | klog power lines |
-| `launch_payload/launch-app.elf` | Close / launch / resume a game. HA writes a 16-byte marker: title ID in bytes 0–9, flag in byte 10 (`K` = close the running game first, `R` with no title = bring back the suspended game). | `ps4_goldhen launch: <title ID> -> 0x<code>`, then AppFocusChanged |
+| `launch_payload/launch-app.elf` | Close / launch / resume a game or app. HA writes a 16-byte marker: title ID in bytes 0–9, flag in byte 10 (`K` = close the running game first, `R` with no title = bring back the suspended game, `C` = close only this title). | `ps4_goldhen launch: <title ID> -> 0x<code>`, then AppFocusChanged |
 | `info_payload/console-info.elf` | Model + serial | one `ps4_goldhen console-info:` line |
 | `sensors_payload/ps4-sensors.elf` (+ `-stop`) | Stays running, prints CPU / SoC temperature, fan duty and fan target every 30 s; a run file on the console keeps one copy | `ps4_goldhen sensors:` lines |
 | `fan_payload/ps4-fan.elf` | Sets the fan target (°C written into a marker); changes one byte of the fan channel's settings and writes the rest back as read | `ps4_goldhen fan: state=set;thr=…;was=…` |
@@ -129,7 +136,7 @@ GoldHEN's servers are small. Breaking one of these rules can freeze or wedge the
   Otherwise the recorder keeps a new state row each time.
 - **Bounded everything:** unfinished klog line 64 KB, a line to the panel 8 KB, recent lines 250, a screenshot read for
   the viewer 32 MB, the console's savedata.db 8 MB. Blocking FTP runs in the executor.
-- **Rate limits instead of loops:** stale-klog DDP check ≤ 1 a minute; automatic live-sensor start ≤ 1 per 10 min;
+- **Rate limits instead of loops:** stale-klog and frozen-console DDP checks ≤ 1 a minute; automatic live-sensor start ≤ 1 per 10 min;
   fan re-send ≤ 1 per 10 min, never mid-game; app.db hourly, skipped in rest / off, an on-demand pull ≤ 1 per title per
   5 min, one at a time.
 - **Settings that change at runtime live in `.storage`, not in the entry options.** Saving options reloads the entry,
@@ -137,6 +144,11 @@ GoldHEN's servers are small. Breaking one of these rules can freeze or wedge the
 - **Copies run only when asked.** Screenshots and saves never run on a schedule (an automation can press the
   buttons). Over FTP, HA writes to a console only for Send to PS4, the panel's deletes (they ask first) and whatever
   is done in the FTP tab.
+- **No FTP to a console known to be in rest mode or off.** Saves and Screenshots answer from HA's last read (memory
+  only) and refuse the actions that need the console; the FTP tab's commands, download and upload refuse
+  (`ftp_session.check_awake`). An unknown power state (klog not connected yet) still tries.
+- **A save backup stops between saves, never mid-file.** Stop is checked before each save starts; the History
+  versions that make room for a save are deleted right before it's copied.
 
 ## Storage and paths
 
@@ -144,7 +156,7 @@ GoldHEN's servers are small. Breaking one of these rules can freeze or wedge the
 |---|---|
 | `/config/ps4/payloads` | Bundled + your own payloads (the Payloads tab, `send_payload`) |
 | `/config/ps4/db/<host>/app.db` | That console's app.db cache |
-| `/config/ps4/covers` | Game icons by title ID |
+| `/config/ps4/covers/<entry>/` | That console's game icons by title ID (checked for changes after each app.db pull) |
 | `/config/ps4/screenshots/<entry>/thumbs` | Screenshot thumbnails, ≤ 200 per console |
 | `<media>/PS4 Screenshots/<console>/<game>/` | Synced screenshots |
 | `/share/PS4 Saves/<console>/<user>/Latest`, `History` | Save copies in Apollo's USB layout (`PS4/SAVEDATA/<16 hex>/<title ID>/`) |
@@ -157,21 +169,22 @@ On the console HA reads `/system_data/priv/mms/app.db`, `/user/av_contents/` (sc
 
 ## HA interfaces
 
-- **Service:** `ps4_goldhen.send_payload` (`payload_file`, optional `ps4_host` and `timeout`; `binloader_port` is
-  accepted and ignored).
+- **Services** (admin only; calls without a user, such as automations, run): `ps4_goldhen.send_payload`
+  (`payload_file` = a name or full path inside `/config/ps4/payloads`, optional `ps4_host`, `binloader_port` and
+  `timeout`), `ps4_goldhen.close_title` (`title_id`, optional `ps4_host`).
 - **WebSocket commands** (all admin only): `ps4_goldhen/list_entries`, `list_payloads`, `ftp_list_dir`,
   `ftp_delete`, `ftp_rename`, `ftp_mkdir`, `ftp_get_text`, `ftp_put_text`, `klog_subscribe`, `play_time`,
   `screenshots/{get,set,list,plan,sync,import,delete}`, `saves/{get,set,list,console,backup,keep,zip,send,delete,clear_sent}`.
 - **HTTP views** (all need an HA login; non-admins get 403): `/api/ps4_goldhen/ftp/download`, `/ftp/upload`,
   `/screenshots/<entry>/full`, `/saves/<entry>/download`.
 - **Dispatcher signals** per entry: `signal_klog_line` (`const.py`), `signal_game_started` / `signal_game_left`
-  (`game_session.py`; reasons `switched`, `closed`, `home_screen`, `rest`, `off`, `klog_lost`).
+  (`game_session.py`; reasons `switched`, `closed`, `home_screen`, `rest`, `off`, `not_responding`, `klog_lost`).
 
 ## Tests and CI
 
 The tests are plain scripts with small HA stand-ins; no HA install and no console needed. Fake servers on loopback
-stand in for FTP, DDP and the Remote Play control channel. 28 Python suites (`tests/test_*.py`) and 7 Node suites
-(`tests/test_*.cjs`, the panel in a sandbox). Commands: [README → Development](../README.md#development).
+stand in for FTP, DDP and the Remote Play control channel. 33 Python suites (`tests/test_*.py`) and 9 Node suites
+(`tests/test_*.cjs`, the panel in a sandbox). Commands: [CONTRIBUTING](CONTRIBUTING.md).
 
 GitHub Actions: `regression.yml` checks Python / JSON / JS syntax and runs every suite on Python 3.13 and 3.14 (with
 `cryptography`) and Node 24. `hassfest.yaml` and `validate.yml` run hassfest and the HACS check. `release.yml` zips
@@ -189,8 +202,7 @@ and don't name a cause that wasn't proven. Test data keeps its timestamps.
 
 ## Open work
 
-The user-facing list is in [README → Known issues](../README.md#known-issues). For contributors:
+The user-facing list is in [USAGE → Known issues](USAGE.md#known-issues). For contributors:
 
-- A frozen console still reads as playing until HA notices: a DDP check while klog is silent could catch it.
 - FTP upload above ~16 MB fails (HA's request size limit, and the whole file is held in memory).
 - Bundled payloads have no firmware-support list yet; with one, the panel could skip its question for known pairs.

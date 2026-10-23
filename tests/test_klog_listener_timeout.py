@@ -1,5 +1,6 @@
 """A klog socket killed by TCP keepalive must not spin the event loop.
 A silent klog socket while the state says rest → DDP check → reconnect if the console is on.
+A silent klog socket while the state says on → DDP check → not responding after two no-replies (frozen).
 
 Seen live: HA was OOM-killed (~5 GB) 1-2 min after a console went fully off / froze, three times. A console
 that loses power never closes the socket, so keepalive gives up ~60 s later with ETIMEDOUT. Python raises that
@@ -35,8 +36,9 @@ def load_listener(fake_asyncio, async_search) -> dict[str, Any]:
     keep = [
         node for node in ast.parse(INIT.read_text()).body
         if (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and node.name in ("_klog_listener_task", "_klog_power_tick", "_klog_stale_check"))
-        or (isinstance(node, ast.Assign) and any(getattr(t, "id", "") == "_STALE_KLOG_CHECK" for t in node.targets))
+            and node.name in ("_klog_listener_task", "_klog_power_tick", "_klog_stale_check", "_klog_frozen_check"))
+        or (isinstance(node, ast.Assign) and any(
+            getattr(t, "id", "") in ("_STALE_KLOG_CHECK", "_FROZEN_SILENCE") for t in node.targets))
     ]
     noop = SimpleNamespace(async_on_klog_connected=lambda *a: None, async_handle_line=lambda *a: False)
     ns: dict[str, Any] = {
@@ -81,9 +83,23 @@ class StateMachine:
     klog_connected = False
     unreachable_calls = 0
     ddp_on_calls = 0
+    heard_calls = 0
+    not_responding = False
 
     def __init__(self, power_state=None):
         self.power_state = power_state
+        self.silence_codes = []
+
+    def on_klog_heard(self):
+        self.heard_calls += 1
+        return False
+
+    def on_ddp_silence_check(self, code):  # the real rule: two no-replies in a row
+        self.silence_codes.append(code)
+        if code is None and self.silence_codes[-2:] == [None, None] and not self.not_responding:
+            self.not_responding = True
+            return True
+        return False
 
     def on_ddp_on(self):
         self.ddp_on_calls += 1
@@ -105,29 +121,34 @@ class StateMachine:
 
 
 class QuietReader(asyncio.StreamReader):
-    """A live but silent console: reads just wait; EOF after `quiet_reads` so the test ends."""
+    """A live but silent console: reads just wait; EOF after `quiet_reads` so the test ends. Read number `talk_at`
+    gets a klog line instead."""
 
-    def __init__(self, quiet_reads: int) -> None:
+    def __init__(self, quiet_reads: int, talk_at: int | None = None) -> None:
         super().__init__()
         self.reads = 0
         self._quiet_reads = quiet_reads
+        self._talk_at = talk_at
 
     async def read(self, n: int = -1) -> bytes:
         self.reads += 1
         if self.reads > self._quiet_reads:
             self.feed_eof()
+        elif self.reads == self._talk_at:
+            self.feed_data(b"<118>[SceShellCore] a line\n")
         return await super().read(n)
 
 
 async def run_listener(
-    exc: BaseException | None, quiet_reads: int = 0, power_state: str | None = None, ddp_reply=None
+    exc: BaseException | None, quiet_reads: int = 0, power_state: str | None = None, ddp_reply=None,
+    talk_at: int | None = None,
 ) -> SimpleNamespace:
     """One connection whose reads fail with `exc` (None = silent socket), then stop at the first reconnect sleep.
 
     Each quiet read moves a fake clock by the listener's 30 s; `ddp_reply` is what the stub DDP `SRCH` returns (an
     exception instance is raised instead).
     """
-    reader = DeadReader(exc) if exc is not None else QuietReader(quiet_reads)
+    reader = DeadReader(exc) if exc is not None else QuietReader(quiet_reads, talk_at)
     run = SimpleNamespace(reader=reader, connects=0, beats=0, searches=[], delays=[], pushed=[])
     clock = [1000.0]
 
@@ -308,6 +329,40 @@ class StaleKlogTests(unittest.TestCase):
                 run = asyncio.run(run_listener(None, quiet_reads=6, power_state=power, ddp_reply=reply(200)))
                 self.assertEqual(run.searches, [])
                 self.assertEqual(run.delays, [10])
+
+
+class FrozenKlogTests(unittest.TestCase):
+    """Silent klog while the state says on. Checks fall every 60 s; DDP is asked from 300 s of silence."""
+
+    def test_no_ddp_reply_twice_is_not_responding(self):
+        run = asyncio.run(run_listener(None, quiet_reads=12, power_state="on", ddp_reply=None))
+        self.assertEqual(run.searches, [1300.0, 1360.0])
+        self.assertEqual(run.machine.silence_codes, [None, None])
+        self.assertTrue(run.machine.not_responding)
+        self.assertTrue(run.pushed, "not responding never reached the coordinator")
+        self.assertEqual(run.delays, [10], "the socket stays open (a frozen console still answers keepalives)")
+
+    def test_ddp_answers_keeps_it_on(self):  # a quiet console that's fine: one SRCH a minute
+        run = asyncio.run(run_listener(None, quiet_reads=14, power_state="on", ddp_reply=reply(200)))
+        self.assertEqual(run.searches, [1300.0, 1360.0, 1420.0])
+        self.assertEqual(run.machine.silence_codes, [200, 200, 200])
+        self.assertFalse(run.machine.not_responding)
+
+    def test_ddp_error_is_not_a_miss(self):
+        run = asyncio.run(run_listener(None, quiet_reads=12, power_state="on",
+                                       ddp_reply=OSError(errno.ENETUNREACH, "unreachable")))
+        self.assertEqual(len(run.searches), 2)
+        self.assertEqual(run.machine.silence_codes, [])
+
+    def test_unknown_power_never_asks(self):
+        run = asyncio.run(run_listener(None, quiet_reads=12, power_state=None, ddp_reply=None))
+        self.assertEqual(run.searches, [])
+
+    def test_klog_data_restarts_the_silence(self):
+        # a line after 210 s: the next 180 s of silence stay under the 300 s
+        run = asyncio.run(run_listener(None, quiet_reads=14, power_state="on", ddp_reply=None, talk_at=8))
+        self.assertEqual(run.machine.heard_calls, 1)
+        self.assertEqual(run.searches, [])
 
 
 if __name__ == "__main__":

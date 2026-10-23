@@ -1,11 +1,12 @@
 """Which game is being played, as signals. Play time and save backup listen.
 
-A game counts as played while the console is on, the game has focus and klog is connected (the source Status and the
-media player read). Each change fires a dispatcher signal for that console:
+A game counts as played while the console is on and responding, the game has focus and klog is connected (the source
+Status and the media player read). Each change fires a dispatcher signal for that console:
 - `signal_game_started(entry_id)` → {entry_id, title_id, name, started}
 - `signal_game_left(entry_id)` → {entry_id, title_id, name, started, ended, reason, background}
   reason: switched (another game took focus) / closed / home_screen (PS button, game still running) / rest / off /
-  klog_lost (HA can't see the console, the game may still run). background=False: the game had focus until `ended`.
+  not_responding (on, but klog silent and no DDP reply: frozen) / klog_lost (HA can't see the console, the game may
+  still run). background=False: the game had focus until `ended`.
   background=True: a game already left running behind the home screen (`suspended_title_id`) was closed, replaced,
   or the console went to rest / off; started / ended are its last time in focus (None if HA didn't see it).
 Unloading the entry (HA restart, options save) fires nothing: nobody left the game.
@@ -29,6 +30,7 @@ REASON_CLOSED = "closed"
 REASON_HOME_SCREEN = "home_screen"
 REASON_REST = "rest"
 REASON_OFF = "off"
+REASON_NOT_RESPONDING = "not_responding"
 REASON_KLOG_LOST = "klog_lost"
 
 _CLOSE_STATE_REASONS = frozenset({"game_close_detected", "bgft_game_stopped", "exit_scene_to_home"})
@@ -63,7 +65,8 @@ class GameSessionTracker:
         power = data.get("power_state")
         tid = data.get(SENSOR_TITLE_ID)
         connected = bool(data.get("klog_connected"))
-        focus = tid if tid and connected and power not in (POWER_REST, POWER_OFF) else None
+        responding = not data.get("not_responding")
+        focus = tid if tid and connected and responding and power not in (POWER_REST, POWER_OFF) else None
         suspended = data.get("suspended_title_id")
         prev_power, prev_suspended = self._power, self.suspended
         self._power, self.suspended = power, suspended
@@ -77,6 +80,8 @@ class GameSessionTracker:
                 reason = REASON_REST
             elif power == POWER_OFF:
                 reason = REASON_OFF
+            elif not responding:
+                reason = REASON_NOT_RESPONDING
             elif not connected:
                 reason = REASON_KLOG_LOST
             elif data.get("state_reason") in _CLOSE_STATE_REASONS:

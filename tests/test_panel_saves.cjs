@@ -79,6 +79,7 @@ function panel(settings, entries = ENTRIES, read = consoleRead()) {
       if (msg.type === 'ps4_goldhen/saves/list') return LIST;
       if (msg.type === 'ps4_goldhen/saves/console') return {...read, power_state: settings.power_state};
       if (msg.type === 'ps4_goldhen/saves/backup') { settings.running = true; return {started: true}; }
+      if (msg.type === 'ps4_goldhen/saves/stop') return {stopping: true};
       if (msg.type === 'ps4_goldhen/saves/keep') return {kept: msg.kept};
       if (msg.type === 'ps4_goldhen/saves/delete') return {deleted: msg.items.length};
       if (msg.type === 'ps4_goldhen/saves/zip') {
@@ -225,7 +226,8 @@ async function main() {
       items: [{title_id: 'CUSA90003', slot: 'SAVEDATAPlayer'}, {title_id: 'CUSA90003', slot: 'sce_sdmemory'}]}));
     assert.equal(p._svSelecting, null, 'done: Select ends');
     // a progress bar above both panes; before the PS4 has been read there's no count yet
-    assert.match(p.shadowRoot.innerHTML, /class="sv-progress" role="progressbar"[^>]*aria-valuemax="0"/);
+    assert.match(p.shadowRoot.innerHTML, /class="sv-progress-track" role="progressbar"[^>]*aria-valuemax="0"/);
+    assert.match(p.shadowRoot.innerHTML, /data-act="stop-backup" >Stop</, 'Stop from the start (the read can be stopped too)');
     assert.match(p.shadowRoot.innerHTML, /Reading the PS4(&#39;|')s saves\.\.\./);
     // in the sticky toolbar, so it stays in view while the list scrolls
     assert.match(p.shadowRoot.innerHTML, /<div class="sticky-bar">\s*<div class="sv-progress"/);
@@ -242,6 +244,18 @@ async function main() {
     await intervals[0]();  // same count a second later: no new reads
     assert.equal(calls.filter((c) => c.type === 'ps4_goldhen/saves/list').length, lists + 1);
     assert.ok(calls.filter((c) => c.type === 'ps4_goldhen/saves/console').every((c) => !c.refresh), 'no FTP read mid-pass');
+    // Stop: asks HA once, the bar says it's stopping until the pass ends; the result says what's left
+    await click({act: 'stop-backup'});
+    assert.equal(calls.filter((c) => c.type === 'ps4_goldhen/saves/stop').length, 1);
+    html = p.shadowRoot.innerHTML;
+    assert.match(html, /Stopping after the save being copied\.\.\./);
+    assert.match(html, /data-act="stop-backup" disabled>Stop</);
+    settings.stopping = true;
+    await intervals[0]();
+    assert.match(p.shadowRoot.innerHTML, /Stopping after the save being copied/, 'still stopping on the next poll');
+    assert.equal(p._svResultText({state: 'stopped', copied: 12, left: 41, retried: 0, open: []}),
+      'Stopped: 12 copied, 41 left. Back up again to copy the rest.');
+    settings.stopping = false;
     settings.progress = {done: 0, total: 0};
     settings.running = false;
     settings.last = {state: 'up_to_date', checked: 2, copied: 1, skipped: 0, retried: 0, already: 1};

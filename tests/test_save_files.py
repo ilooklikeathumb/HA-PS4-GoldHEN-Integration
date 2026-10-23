@@ -15,6 +15,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest.mock import patch
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -244,6 +245,55 @@ class HaCopies(unittest.TestCase):
         self.assertEqual([p.name for p in self.staging.iterdir()], [])
         self.assertEqual(sf.local_slot(self.user, GAME_C, "SAVEDATAPlayer"), info)
 
+    def test_an_interrupted_install_is_repaired(self):
+        """HA stopped (crash, power cut) between install()'s renames: the next pass's repair leaves whole pairs only, and
+        the old copy whole again when it stopped between the two History moves."""
+        slot = "SAVEDATAPlayer"
+        for fail_at in range(5):  # image → History, key → History, its save.json, image → Latest, key → Latest
+            with self.subTest(fail_at=fail_at):
+                self.tearDown()
+                self.setUp()
+                latest = sf.latest_dir(self.user, GAME_C)
+                self.back_up(GAME_C, slot, "Game C")
+                sf.merge_latest_meta(self.user, {GAME_C: {slot: {"name": "Chapter 1"}}})
+                write_save(self.console, UID, GAME_C, slot, b"Q" * 300, "20261016020000", "20261016011910")
+                info = sf.list_slots(self.ftp, UID, GAME_C)[slot]
+                staged = sf.fetch_slot(self.ftp, UID, GAME_C, slot, info, self.staging)
+                real, done = os.replace, []
+
+                def replace(src, dst):
+                    if len(done) == fail_at:
+                        raise OSError("power cut")
+                    done.append(dst)
+                    real(src, dst)
+                with patch.object(sf.os, "replace", replace), self.assertRaises(OSError):
+                    sf.install(self.user, GAME_C, slot, staged, "Game C", timezone.utc)
+
+                sf.repair_half_pairs(self.user)
+                self.assertEqual((latest / slot).is_file(), (latest / f"{slot}.bin").is_file(), "Latest: a pair or none")
+                for version in sf.versions(self.user):
+                    folder = sf.usb_tree(version["path"], GAME_C)
+                    self.assertTrue((folder / slot).is_file() and (folder / f"{slot}.bin").is_file(), version["stamp"])
+                if fail_at == 1:  # the old copy's image was in History, its key still in Latest
+                    [version] = sf.versions(self.user)
+                    old = sf.usb_tree(version["path"], GAME_C)
+                    self.assertEqual((old / slot).read_bytes(), b"P" * 300)
+                    self.assertEqual(sf.version_meta(version["path"]), {"name": "Chapter 1"})
+                    self.assertNotIn(slot, sf.latest_meta(self.user).get(GAME_C, {}))
+                if not (latest / slot).is_file():
+                    self.assertTrue(sf.is_changed(info, sf.local_slot(self.user, GAME_C, slot)), "copied again")
+                    self.assertNotIn(slot, sf.latest_meta(self.user).get(GAME_C, {}), "no name for a copy that's gone")
+                self.assertEqual(sf.repair_half_pairs(self.user), 0, "nothing left to repair")
+
+    def test_repair_leaves_whole_copies_alone(self):
+        self.back_up(GAME_C, "SAVEDATAPlayer", "Game C")
+        self.back_up(GAME_C, "SAVEDATAPlayer", "Game C")
+        (sf.latest_dir(self.user, GAME_C) / "notes.txt").write_text("mine")
+        before = sorted(p for p in self.user.rglob("*"))
+        self.assertEqual(sf.repair_half_pairs(self.user), 0)
+        self.assertEqual(sorted(p for p in self.user.rglob("*")), before)
+        self.assertEqual(sf.repair_half_pairs(self.tmp / "nobody"), 0, "no folder yet")
+
     def test_latest_slots_usage_zip(self):
         self.back_up(GAME_C, "SAVEDATAPlayer", "Game C")
         self.back_up(GAME_C, "sce_sdmemory", "Game C")
@@ -374,26 +424,62 @@ class FakeUsb(unittest.TestCase):
         self.assertNotIn(f"{self.fake}/SAVEDATAPlayer", self.c.files)
 
     def test_clear_takes_only_what_ha_sent(self):
+        """By what HA recorded at the send, never by name: a save-shaped file HA didn't send stays, even in HA's folder."""
         sf.send_to_fake_usb(self.ftp, self.members)
+        sent = sf.fake_usb_paths(self.members)
+        self.assertEqual(sent, [f"{self.fake}/SAVEDATAPlayer", f"{self.fake}/SAVEDATAPlayer.bin"])
         other_account = "/data/fakeusb/PS4/SAVEDATA/1234567890abcdef/CUSA00001"
         self.c.add_dir("/data/fakeusb/PS4/SAVEDATA/1234567890abcdef", "20261016120000")
         self.c.add_dir(other_account, "20261016120000")
         self.c.add_file(f"{other_account}/SAVEDATA00", b"x", "20261016120000")
         self.c.add_dir("/data/fakeusb/PS4/APOLLO", "20261016120000")
         self.c.add_file(f"{sf.FAKE_USB_SAVES}/notes.txt", b"mine", "20261016120000")
-        self.c.add_file(f"{self.fake}/readme.txt", b"mine", "20261016120000")
-        self.assertEqual(sf.clear_fake_usb(self.ftp), 2)
+        theirs = [f"{self.fake}/SAVEDATA00", f"{self.fake}/SAVEDATA00.bin", f"{self.fake}/readme.txt"]
+        for path in theirs:
+            self.c.add_file(path, b"mine", "20261016120000")
+        self.assertEqual(sf.clear_fake_usb(self.ftp, sent), 2)
         self.assertNotIn(f"{self.fake}/SAVEDATAPlayer", self.c.files)
-        self.assertIn(f"{self.fake}/readme.txt", self.c.files, "not a save file name: stays, so its folder stays")
-        for kept in (f"{other_account}/SAVEDATA00", f"{sf.FAKE_USB_SAVES}/notes.txt"):
+        self.assertNotIn(f"{self.fake}/SAVEDATAPlayer.bin", self.c.files)
+        for kept in (*theirs, f"{other_account}/SAVEDATA00", f"{sf.FAKE_USB_SAVES}/notes.txt"):
             self.assertIn(kept, self.c.files)
         self.assertIn("/data/fakeusb/PS4/APOLLO", self.c.dirs)
-        self.c.files.pop(f"{self.fake}/readme.txt")
-        self.c.dirs[self.fake].pop("readme.txt")
+        self.assertIn(self.fake, self.c.dirs, "it still holds files HA didn't send")
+        self.assertEqual(sf.clear_fake_usb(self.ftp, sent), 0, "already gone (deleted on the console): no error")
+        for path in theirs:
+            self.c.files.pop(path)
+            self.c.dirs[self.fake].pop(path.rsplit("/", 1)[1])
         sf.send_to_fake_usb(self.ftp, self.members)
-        self.assertEqual(sf.clear_fake_usb(self.ftp), 2)
+        self.assertEqual(sf.clear_fake_usb(self.ftp, sent), 2)
         self.assertNotIn(self.fake, self.c.dirs, "the emptied title folder goes")
-        self.assertEqual(sf.clear_fake_usb(WritableFTP(save_console())), 0, "no Fake USB folder yet: nothing to do")
+        self.assertEqual(sf.clear_fake_usb(WritableFTP(save_console()), sent), 0, "no Fake USB folder yet: nothing to do")
+
+    def test_a_record_never_reaches_outside_has_folder(self):
+        outside = ["/data/fakeusb/PS4/SAVEDATA/1234567890abcdef/CUSA00001/SAVEDATA00", f"{H}/{UID}/savedata/{GAME_C}/"
+                   "SAVEDATAPlayer.bin", f"{self.fake}/../{GAME_C}/x", f"{self.fake}/readme.txt", f"{self.fake}/sub/s"]
+        for path in outside[:2]:
+            self.c.add_dir(path.rsplit("/", 1)[0], "20261016120000")
+            self.c.add_file(path, b"x", "20261016120000")
+        self.assertEqual(sf.clear_fake_usb(self.ftp, outside), 0)
+        self.assertEqual(self.ftp.deleted, [])
+
+    def test_taken_names_are_found_before_a_send(self):
+        """A file HA would write over that it didn't send: the send is refused before any write."""
+        sent = sf.fake_usb_paths(self.members)
+        self.assertEqual(sf.fake_usb_taken(self.ftp, sent), [], "no folder yet")
+        self.c.add_dir("/data/fakeusb", "20261016120000")
+        for folder in ("/data/fakeusb/PS4", "/data/fakeusb/PS4/SAVEDATA", sf.FAKE_USB_SAVES, self.fake):
+            self.c.add_dir(folder, "20261016120000")
+        self.c.add_file(f"{self.fake}/SAVEDATAPlayer.bin", b"mine", "20261016120000")
+        self.c.add_file(f"{self.fake}/SAVEDATA00", b"mine", "20261016120000")
+        self.assertEqual(sf.fake_usb_taken(self.ftp, sent), [f"{self.fake}/SAVEDATAPlayer.bin"])
+
+    def test_a_send_record_from_before_names_its_files(self):
+        """1.0.0 kept no file list, only the saves it sent: those give the files to clear after an update."""
+        sent = {"saves": [{"title_id": GAME_C, "slot": "SAVEDATAPlayer", "stamp": None, "name": "Chapter 1"},
+                          {"title_id": "../x", "slot": "s"}, {"title_id": OTHER, "slot": "a/b"}, "junk"]}
+        self.assertEqual(sf.sent_files(sent), [f"{self.fake}/SAVEDATAPlayer", f"{self.fake}/SAVEDATAPlayer.bin"])
+        for empty in (None, {}, {"saves": None}):
+            self.assertEqual(sf.sent_files(empty), [])
 
     def test_listing_what_sits_there(self):
         """The PS4 pane shows the Fake USB folder as it is."""

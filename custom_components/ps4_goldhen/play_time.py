@@ -8,7 +8,8 @@ Kept in .storage/ps4_goldhen.play_time.<entry> (no recorder or history queries):
   days     {local date: {title_id: seconds}}                    the last 400 days
   sessions [{title_id, name, start, end, seconds}]               the last 1000, oldest first
   open     the session in progress (or paused < 30 min), else None
-Device page: Play time today (feeds HA's long-term statistics) + Current session. Panel tab: ps4_goldhen/play_time.
+Device page: Play time today (feeds HA's long-term statistics) + Current session. Panel tab: ps4_goldhen/play_time;
+the Content tab's game page reads `title_summary` (games.py).
 """
 from __future__ import annotations
 
@@ -40,6 +41,8 @@ MAX_STEP = timedelta(minutes=10)  # most one accrual counts: a clock jump or a s
 DAYS_KEPT = 400
 SESSIONS_KEPT = 1000
 PANEL_SESSIONS = 50
+GAME_DAYS = 30        # the game page's bar strip
+GAME_SESSIONS = 10
 _SAVE_DELAY = 10      # s; shorter than TICK, so a save lands between ticks (each call restarts Store's timer)
 _STORE_VERSION = 1
 
@@ -171,6 +174,26 @@ class PlayTimeBook:
             "since": min(firsts) if firsts else None,
             "games": games,
             "sessions": recent[:PANEL_SESSIONS],
+        }
+
+    def title_summary(self, title_id: str, now: datetime) -> dict[str, Any]:
+        """One game for the panel's game page: lifetime + 7 / 30 days, the last GAME_DAYS days (oldest first, 0 for
+        a day without play) and its newest GAME_SESSIONS sessions (the open one first)."""
+        today = self.local_day(now)
+        days = [(today - timedelta(days=n)).isoformat() for n in range(GAME_DAYS - 1, -1, -1)]
+        per_day = [{"day": day, "seconds": self.days.get(day, {}).get(title_id, 0.0)} for day in days]
+        g = self.games.get(title_id) or {}
+        o = self.open if self.open and self.open["title_id"] == title_id and self.open["seconds"] > 0 else None
+        recent = [dict(s, open=False, playing=False) for s in reversed(self.sessions) if s["title_id"] == title_id]
+        if o:
+            recent.insert(0, {"title_id": title_id, "name": o.get("name"), "start": o["start"], "end": o["last"],
+                              "seconds": o["seconds"], "open": True, "playing": self.active == title_id})
+        return {
+            "seconds": g.get("seconds", 0.0), "sessions": g.get("sessions", 0) + (1 if o else 0),
+            "first": g.get("first"), "last": g.get("last"),
+            "week": round(sum(d["seconds"] for d in per_day[-7:]), 1),
+            "month": round(sum(d["seconds"] for d in per_day), 1),
+            "days": per_day, "recent": recent[:GAME_SESSIONS],
         }
 
     # ── internals ──────────────────────────────────────────────────────────────

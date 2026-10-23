@@ -18,7 +18,8 @@ from pruning. History is thinned like Time Machine / Syncthing's staggered versi
 
 Restore: HA uploads a copy into Apollo's Fake USB folder on a console, /data/fakeusb/PS4/SAVEDATA/0000000000000000/
 <title ID>/ (the only console folder HA writes to), then Apollo → USB Saves → Copy save game to HDD. The same tree
-also unpacks from a zip onto a real stick.
+also unpacks from a zip onto a real stick. HA records the files it uploads and only ever deletes those; a file already
+there that HA didn't send stops a send before anything is written.
 
 Save names: the console's own save list, /system_data/savedata/<user ID>/db/user/savedata.db (SQLite,
 Apollo saves.h SAVES_DB_PATH; 16 KB on a PS4 Pro, journal_mode delete), table savedata: title_id, dir_name (= the slot),
@@ -231,6 +232,13 @@ def _sent_name(name: str) -> bool:
     return valid_slot(name[:-4] if name.endswith(".bin") else name)
 
 
+def _in_fake_usb(remote: str) -> bool:
+    """FAKE_USB_SAVES/<title>/<save file name>, nothing else."""
+    folder, _, name = remote.rpartition("/")
+    parent, _, title = folder.rpartition("/")
+    return parent == FAKE_USB_SAVES and valid_title(title) and _sent_name(name)
+
+
 def fake_usb_remote(rel: str) -> str:
     """A zip_members name (PS4/SAVEDATA/<account>/<title>/<file>) → its path in the console's Fake USB folder."""
     parts = rel.split("/")
@@ -250,22 +258,51 @@ def _ensure_dir(ftp: ftplib.FTP, path: str) -> None:
             ftp.mkd(current)
 
 
-def clear_fake_usb(ftp: ftplib.FTP) -> int:
-    """Delete what HA sent before: save files in FAKE_USB_SAVES/<title>/, then the emptied title folders. Anything
-    else under /data/fakeusb (another account folder, Apollo's own exports) stays. Returns files deleted."""
+def fake_usb_paths(members: list[tuple[Path, str]]) -> list[str]:
+    """Where a send puts each of its files (zip_members names) on the console: what HA records before uploading."""
+    return [fake_usb_remote(rel) for _, rel in members]
+
+
+def sent_files(sent: Any) -> list[str]:
+    """The files a send record from before file lists were kept (its `saves`) put in the Fake USB folder."""
+    out = []
+    for save in (sent.get("saves") if isinstance(sent, dict) else None) or ():
+        if isinstance(save, dict) and valid_title(save.get("title_id")) and valid_slot(save.get("slot")):
+            folder = f"{FAKE_USB_SAVES}/{save['title_id']}"
+            out += [f"{folder}/{save['slot']}", f"{folder}/{save['slot']}.bin"]
+    return out
+
+
+def clear_fake_usb(ftp: ftplib.FTP, files: Iterable[str]) -> int:
+    """Delete the files HA uploaded (`files`, recorded at the send), then their title folders if that emptied them.
+    Nothing else is touched, whatever its name: a file the user or Apollo put there stays, and so does its folder. A
+    recorded path outside FAKE_USB_SAVES/<title>/ is skipped; one that's gone already is fine. Returns files deleted."""
     deleted = 0
-    for title in _entries(ftp, FAKE_USB_SAVES):
-        if not title["is_dir"] or not valid_title(title["name"]):
+    folders = set()
+    for remote in files:
+        if not _in_fake_usb(remote):
             continue
-        folder = f"{FAKE_USB_SAVES}/{title['name']}"
-        for item in _entries(ftp, folder):
-            if not item["is_dir"] and _sent_name(item["name"]):
-                ftp.delete(f"{folder}/{item['name']}")
-                deleted += 1
-        ftp.cwd(FAKE_USB_SAVES)
+        folders.add(remote.rpartition("/")[0])
+        try:
+            ftp.delete(remote)
+        except ftplib.error_perm:  # 550: deleted on the console already
+            continue
+        deleted += 1
+    for folder in sorted(folders):
         with contextlib.suppress(ftplib.error_perm):
+            ftp.cwd(FAKE_USB_SAVES)
             ftp.rmd(folder)  # only succeeds when empty
     return deleted
+
+
+def fake_usb_taken(ftp: ftplib.FTP, remotes: list[str]) -> list[str]:
+    """The ones of `remotes` already on the console. Run after HA's own were cleared: these are someone else's, and
+    a send would write over them."""
+    taken = []
+    for folder in sorted({r.rpartition("/")[0] for r in remotes}):
+        names = {e["name"] for e in _entries(ftp, folder) if not e["is_dir"]}
+        taken += [r for r in remotes if r.rpartition("/")[0] == folder and r.rpartition("/")[2] in names]
+    return taken
 
 
 def list_fake_usb(ftp: ftplib.FTP) -> dict[str, list[str]]:
@@ -430,6 +467,61 @@ def install(user_dir: Path, title: str, slot: str, staged: tuple[Path, Path], la
     if old_name is not None:
         _set_latest_meta(user_dir, meta)
     return made
+
+
+def repair_half_pairs(user_dir: Path) -> int:
+    """Finish or drop what an interrupted install() left (HA stopped between its renames), so every copy is a whole
+    pair again. A key left in Latest beside a History version holding only its image goes back to that version (the
+    old copy is whole again, with its name). Any other lone file in Latest goes, with its name: the next pass copies
+    the slot again. So does a name kept for a Latest copy that's gone. A History version still missing a file goes (an
+    image can't be restored without its key). Returns the files moved or deleted."""
+    fixed = 0
+    waiting: dict[tuple[str, str], list[dict[str, Any]]] = {}  # History versions with the image only
+    broken = []
+    for version in versions(user_dir):
+        folder = usb_tree(version["path"], version["title"])
+        image, key = folder / version["slot"], folder / f"{version['slot']}.bin"
+        if not (image.is_file() and key.is_file()):
+            broken.append(version)
+            if image.is_file():
+                waiting.setdefault((version["title"], version["slot"]), []).append(version)
+    meta = latest_meta(user_dir)
+    named = False
+    root = _account_dir(user_dir / LATEST)
+    for title_dir in sorted(root.iterdir()) if root.is_dir() else ():
+        if not (title_dir.is_dir() and valid_title(title_dir.name)):
+            continue
+        title = title_dir.name
+        slots = {p.name[:-4] if p.name.endswith(".bin") else p.name for p in title_dir.iterdir()
+                 if p.is_file() and _sent_name(p.name)}
+        for slot in sorted(slots):
+            image, key = title_dir / slot, title_dir / f"{slot}.bin"
+            if image.is_file() == key.is_file():
+                continue
+            name = meta.get(title, {}).pop(slot, None)
+            named |= name is not None
+            image_only = waiting.get((title, slot), [])
+            if key.is_file() and len(image_only) == 1:
+                version = image_only[0]
+                os.replace(key, usb_tree(version["path"], title) / f"{slot}.bin")
+                broken.remove(version)
+                if name:
+                    _write_json(version["path"] / VERSION_META, name)
+            else:
+                (key if key.is_file() else image).unlink()
+            fixed += 1
+        with contextlib.suppress(OSError):
+            title_dir.rmdir()  # only succeeds when empty
+    for title, slots in meta.items():  # a name whose copy moved to History before the new one arrived
+        for slot in [s for s in slots if local_slot(user_dir, title, s) is None]:
+            del slots[slot]
+            named = True
+    for version in broken:
+        fixed += sum(1 for p in version["path"].rglob("*") if p.is_file())
+        delete_version(version)
+    if named:
+        _set_latest_meta(user_dir, meta)
+    return fixed
 
 
 def delete_latest(user_dir: Path, title: str, slot: str) -> bool:

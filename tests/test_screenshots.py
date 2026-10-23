@@ -382,6 +382,26 @@ class ListAndLatest(Base):
         await ss.async_list(self.hass, "console_a", 0, 1)
         self.assertEqual(SIGNALS, [], "same latest shot: no state write")
 
+    async def test_one_games_page(self):  # the Content tab: one game's shots, the tab's list and latest left alone
+        await self.turn_on()
+        before = len(self.ftp_sessions)
+        page = await ss.async_list(self.hass, "console_a", 0, 6, "CUSA90005")
+        self.assertEqual([s["rel"] for s in page["shots"]], [GAME_D_LATE, GAME_D_EARLY])
+        self.assertTrue(all(s["thumb"] for s in page["shots"]))
+        self.assertFalse(page["more"])
+        walk = self.ftp_sessions[before]
+        self.assertNotIn(f"{cf.PHOTO_ROOT}/NPXS20001/NPXS20001", walk.listings, "no other game's folder")
+        self.assertIsNone(self.rt().shown)
+        self.assertIsNone(self.rt().settings["latest"])
+        self.assertIsNone(page["read_at"])
+        await ss.async_list(self.hass, "console_a", 0, 24)  # the tab's read
+        self.hass.data[const.DOMAIN]["console_a"]["coordinator"].data = {"power_state": "rest"}
+        before = len(self.ftp_sessions)
+        page = await ss.async_list(self.hass, "console_a", 0, 6, "CUSA90005")
+        self.assertEqual((page["shots"], page["asleep"]), ([], True), "asleep: none (HA's last read is the newest only)")
+        self.assertEqual(len(self.ftp_sessions), before, "no FTP to a sleeping console")
+        self.assertEqual(len((await ss.async_list(self.hass, "console_a", 0, 24))["shots"]), 3, "the tab's read stays")
+
     async def test_thumbnail_cache_is_capped(self):
         await self.turn_on()
         for i in range(30):
@@ -537,6 +557,15 @@ class Sync(Base):
         self.assertEqual(await self.run_sync(kind="newest", count=5), 1, "newest N counts only new shots")
         self.assertEqual(len(self.copies()), 3)
         self.assertEqual(await self.run_sync(kind="selected", rels=[HOME, "../x.jpg"]), 0, "already in HA")
+
+    async def test_one_game_walks_only_that_game(self):  # the Content tab's Sync screenshots, no dialog before it
+        await self.turn_on()
+        before = len(self.ftp_sessions)
+        self.assertEqual(await self.run_sync(kind="game", title_id="CUSA90005"), 2)
+        listed = [p for f in self.ftp_sessions[before:] for p in f.listings]
+        self.assertIn(f"{cf.PHOTO_ROOT}/NPXS20001/CUSA90005", listed)
+        self.assertNotIn(f"{cf.PHOTO_ROOT}/NPXS20001/NPXS20001", listed)
+        self.assertNotIn(f"{cf.PHOTO_ROOT}/NPXS20001", listed, "the app's game folders aren't listed")
 
     async def test_limit_copies_the_newest_that_fit_and_says_so(self):
         await self.turn_on()
@@ -722,6 +751,99 @@ class RealEntities(Base):
         await ss.async_list(self.hass, "console_a", 0, 1)
         image = await self.attach(ents.PS4LatestScreenshotImage(self.hass, self.entry))
         self.assertEqual(image.extra_state_attributes["title_id"], "NPXS20001")
+
+
+class Asleep(Base):
+    """A console in rest mode or off gets no FTP: the list shows HA's last read, the console actions refuse."""
+
+    def power(self, state):
+        self.hass.data[const.DOMAIN]["console_a"]["coordinator"].data = {"power_state": state}
+
+    async def test_list_shows_the_last_read_without_ftp(self):
+        await self.turn_on()
+        self.power("on")
+        awake = await ss.async_list(self.hass, "console_a", 0, 2)
+        self.assertEqual((awake["asleep"], awake["read_at"]), (False, "2026-10-16T04:00:00+00:00"))
+        await ss.async_import_one(self.hass, "console_a", GAME_D_LATE)
+        before = len(self.ftp_sessions)
+        for state in ("rest", "off"):
+            self.power(state)
+            page = await ss.async_list(self.hass, "console_a", 0, 2)
+            self.assertEqual([s["rel"] for s in page["shots"]], [HOME, GAME_D_LATE])
+            self.assertEqual((page["asleep"], page["power_state"], page["more"]), (True, state, False))
+            self.assertEqual(page["read_at"], "2026-10-16T04:00:00+00:00")
+            self.assertTrue(page["shots"][1]["in_ha"], "In HA comes from HA's folder, not the last read")
+            self.assertTrue(page["shots"][0]["thumb"].startswith("data:image/jpeg;base64,"), "thumbnails from the cache")
+        self.assertEqual(len(self.ftp_sessions), before, "no FTP to a sleeping console")
+
+    async def test_show_more_pages_through_the_last_read(self):
+        await self.turn_on()
+        self.power("on")
+        await ss.async_list(self.hass, "console_a", 0, 1)
+        await ss.async_list(self.hass, "console_a", 1, 1)
+        self.power("rest")
+        before = len(self.ftp_sessions)
+        first = await ss.async_list(self.hass, "console_a", 0, 1)
+        second = await ss.async_list(self.hass, "console_a", 1, 1)
+        self.assertEqual(([s["rel"] for s in first["shots"]], first["more"]), ([HOME], True))
+        self.assertEqual(([s["rel"] for s in second["shots"]], second["more"]), ([GAME_D_LATE], False),
+                         "the 3rd shot was never read: no page for it")
+        self.assertEqual(len(self.ftp_sessions), before)
+
+    async def test_nothing_read_yet_is_an_empty_page(self):
+        await self.turn_on()
+        self.power("rest")
+        page = await ss.async_list(self.hass, "console_a", 0, 24)
+        self.assertEqual((page["shots"], page["more"], page["asleep"], page["read_at"]), ([], False, True, None))
+        self.assertEqual(self.ftp_sessions, [])
+
+    async def test_unknown_power_still_reads(self):
+        """Like save backup: only a console known to be in rest mode or off is skipped."""
+        await self.turn_on()
+        page = await ss.async_list(self.hass, "console_a", 0, 1)
+        self.assertEqual((page["asleep"], len(page["shots"])), (False, 1))
+        self.assertEqual(len(self.ftp_sessions), 1)
+
+    async def test_console_actions_refuse(self):
+        await self.turn_on()
+        self.power("on")
+        await ss.async_list(self.hass, "console_a", 0, 24)
+        await ss.async_import_one(self.hass, "console_a", HOME)
+        self.power("rest")
+        before = len(self.ftp_sessions)
+        calls = (
+            lambda: ss.async_plan(self.hass, "console_a"),
+            lambda: ss.async_start_sync(self.hass, "console_a", {"kind": "all"}),
+            lambda: ss.async_import_one(self.hass, "console_a", GAME_D_LATE),
+            lambda: ss.async_import_latest(self.hass, self.entry),
+            lambda: ss.async_delete(self.hass, "console_a", [HOME], ha=True, ps4=True),
+        )
+        for call in calls:
+            with self.assertRaises(HomeAssistantError) as ctx:
+                await call()
+            self.assertIn("rest mode or off: turn it on first", str(ctx.exception))
+        self.assertEqual(len(self.ftp_sessions), before, "no FTP to a sleeping console")
+        self.assertFalse(self.rt().op_lock.locked())
+        self.assertEqual(self.copies(), ["Home screen/20261015_214637_00434169.jpg"], "a refused delete deletes nothing")
+        done = await ss.async_delete(self.hass, "console_a", [HOME], ha=True, ps4=False)
+        self.assertEqual(done, {"ha_deleted": 1, "ps4_deleted": 0}, "HA's copies can go while it sleeps")
+        self.assertEqual(self.copies(), [])
+
+    async def test_a_ps4_delete_leaves_the_last_read(self):
+        await self.turn_on()
+        self.power("on")
+        await ss.async_list(self.hass, "console_a", 0, 24)
+        await ss.async_delete(self.hass, "console_a", [GAME_D_LATE], ha=False, ps4=True)
+        self.power("rest")
+        page = await ss.async_list(self.hass, "console_a", 0, 24)
+        self.assertNotIn(GAME_D_LATE, [s["rel"] for s in page["shots"]])
+
+    async def test_turning_off_forgets_the_last_read(self):
+        await self.turn_on()
+        self.power("on")
+        await ss.async_list(self.hass, "console_a", 0, 24)
+        await ss.async_set_settings(self.hass, "console_a", {"enabled": False})
+        self.assertIsNone(self.rt().shown)
 
 
 class PanelErrors(Base):

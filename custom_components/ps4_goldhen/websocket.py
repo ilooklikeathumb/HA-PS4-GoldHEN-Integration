@@ -124,6 +124,8 @@ async def ws_list_dir(
     try:
         entries = await _ftp(hass, msg["entry_id"], _ftp_list_dir, host, port, path)
         connection.send_result(msg["id"], {"path": path, "entries": entries})
+    except ftp_session.ConsoleAsleep as err:
+        connection.send_error(msg["id"], "console_asleep", str(err))
     except ftp_session.FTPBusy as err:
         connection.send_error(msg["id"], "ftp_busy", str(err))
     except ftplib.all_errors as err:
@@ -153,6 +155,8 @@ async def ws_delete(
     try:
         await _ftp(hass, msg["entry_id"], _ftp_delete, host, port, msg["path"], msg["is_dir"])
         connection.send_result(msg["id"], {"success": True})
+    except ftp_session.ConsoleAsleep as err:
+        connection.send_error(msg["id"], "console_asleep", str(err))
     except ftp_session.FTPBusy as err:
         connection.send_error(msg["id"], "ftp_busy", str(err))
     except ftplib.all_errors as err:
@@ -182,6 +186,8 @@ async def ws_rename(
     try:
         await _ftp(hass, msg["entry_id"], _ftp_rename, host, port, msg["from_path"], msg["to_path"])
         connection.send_result(msg["id"], {"success": True})
+    except ftp_session.ConsoleAsleep as err:
+        connection.send_error(msg["id"], "console_asleep", str(err))
     except ftp_session.FTPBusy as err:
         connection.send_error(msg["id"], "ftp_busy", str(err))
     except ftplib.all_errors as err:
@@ -210,6 +216,8 @@ async def ws_mkdir(
     try:
         await _ftp(hass, msg["entry_id"], _ftp_mkdir, host, port, msg["path"])
         connection.send_result(msg["id"], {"success": True})
+    except ftp_session.ConsoleAsleep as err:
+        connection.send_error(msg["id"], "console_asleep", str(err))
     except ftp_session.FTPBusy as err:
         connection.send_error(msg["id"], "ftp_busy", str(err))
     except ftplib.all_errors as err:
@@ -238,6 +246,8 @@ async def ws_get_text(
     try:
         content = await _ftp(hass, msg["entry_id"], _ftp_get_text, host, port, msg["path"])
         connection.send_result(msg["id"], {"content": content})
+    except ftp_session.ConsoleAsleep as err:
+        connection.send_error(msg["id"], "console_asleep", str(err))
     except ftp_session.FTPBusy as err:
         connection.send_error(msg["id"], "ftp_busy", str(err))
     except ftplib.all_errors as err:
@@ -267,6 +277,8 @@ async def ws_put_text(
     try:
         await _ftp(hass, msg["entry_id"], _ftp_put_text, host, port, msg["path"], msg["content"])
         connection.send_result(msg["id"], {"success": True})
+    except ftp_session.ConsoleAsleep as err:
+        connection.send_error(msg["id"], "console_asleep", str(err))
     except ftp_session.FTPBusy as err:
         connection.send_error(msg["id"], "ftp_busy", str(err))
     except ftplib.all_errors as err:
@@ -330,10 +342,11 @@ async def ws_klog_subscribe(
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 async def _ftp(hass: HomeAssistant, entry_id: str, func, *args):
-    """A panel FTP action under the console's FTP lock (ftp_session): it waits its turn, at most FTP_BUSY_WAIT."""
-    return await ftp_session.run(
-        hass, hass.data[DOMAIN][entry_id], func, *args, wait=ftp_session.FTP_BUSY_WAIT
-    )
+    """A panel FTP action under the console's FTP lock (ftp_session): it waits its turn, at most FTP_BUSY_WAIT. None
+    on a console in rest mode or off."""
+    data = hass.data[DOMAIN][entry_id]
+    ftp_session.check_awake(data)
+    return await ftp_session.run(hass, data, func, *args, wait=ftp_session.FTP_BUSY_WAIT)
 
 
 def _get_ftp_params(hass: HomeAssistant, entry_id: str) -> tuple[str, int]:

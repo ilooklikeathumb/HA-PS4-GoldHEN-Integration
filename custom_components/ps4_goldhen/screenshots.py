@@ -9,7 +9,8 @@ time: HA copy and/or PS4 original. The console's own thumbnails (~11 KB) are cac
 /config/ps4/screenshots/<entry>/thumbs, at most 200 per console; a full walk drops those of shots gone from the PS4.
 HA keeps to one FTP session per console: every session here takes the entry's FTP lock (shared with the cover fetch),
 a sync reconnects every 25 files so the cover fetch and app.db pull get a turn, and a refused connect is retried.
-Console-side layout and the newest-shot walk: capture_files.py.
+A console in rest mode or off gets no FTP: the panel's list shows HA's last read and the actions that need the
+console refuse. Console-side layout and the newest-shot walk: capture_files.py.
 """
 from __future__ import annotations
 
@@ -39,7 +40,7 @@ from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 
 from . import capture_files as cf
-from .const import DOMAIN, POWER_ON, PS4_CONFIG_DIR, SENSOR_TITLE_ID
+from .const import DOMAIN, POWER_OFF, POWER_ON, POWER_REST, PS4_CONFIG_DIR, SENSOR_TITLE_ID
 from .dynamic_entities import DynamicEntities
 from .entity import device_name
 from .ftp_session import session as _session  # shared with save backup
@@ -91,6 +92,7 @@ class _Runtime:
     usage: dict[str, int] = field(default_factory=lambda: {"count": 0, "bytes": 0})
     names: set[str] = field(default_factory=set)  # file names of the copies in HA (the folder is the truth)
     plan: tuple[float, list[dict[str, Any]]] | None = None
+    shown: dict[str, Any] | None = None  # the panel's last list read: {read_at, shots}. Memory only.
     prev: tuple[Any, Any] = (None, None)
     auto_cancel: Callable[[], None] | None = None
     dynamic: DynamicEntities = field(init=False)
@@ -252,12 +254,14 @@ async def _async_save(hass: HomeAssistant, rt: _Runtime) -> None:
     async_dispatcher_send(hass, signal(rt.entry.entry_id))
 
 
-async def _async_newest(hass: HomeAssistant, rt: _Runtime, count: int, offset: int = 0) -> list[dict[str, Any]]:
-    """The newest offset+count shots (+1 to know if there are more), thumbnails for the page and the latest shot."""
+async def _async_newest(hass: HomeAssistant, rt: _Runtime, count: int, offset: int = 0,
+                        title_id: str | None = None) -> list[dict[str, Any]]:
+    """The newest offset+count shots (+1 to know if there are more), thumbnails for the page and the latest shot.
+    With `title_id`: one game's shots (the game page), and the console's latest shot stays as it was."""
     cache = _cache_dir(rt.entry.entry_id)
 
     def _work(ftp: ftplib.FTP) -> list[dict[str, Any]]:
-        shots = cf.newest_shots(ftp, offset + count + 1)
+        shots = cf.newest_shots(ftp, offset + count + 1, title_id)
         cf.fetch_thumbs(ftp, cache, shots[:1] + shots[offset:offset + count])
         return shots
 
@@ -265,6 +269,8 @@ async def _async_newest(hass: HomeAssistant, rt: _Runtime, count: int, offset: i
     used = [cf.thumb_local(cache, s["rel"]) for s in shots[:1] + shots[offset:offset + count]]
     await hass.async_add_executor_job(cf.touch, used)
     await hass.async_add_executor_job(cf.prune_thumbs, cache, THUMB_CAP)
+    if title_id is not None:
+        return shots
     latest = shots[0] if shots else None
     if latest != rt.settings["latest"]:
         rt.settings["latest"] = latest
@@ -321,11 +327,21 @@ def _check_free(rt: _Runtime) -> None:
         raise HomeAssistantError("Busy: a screenshot sync is running for this PS4")
 
 
+def _asleep(hass: HomeAssistant, entry_id: str) -> bool:
+    return _power(hass, entry_id) in (POWER_REST, POWER_OFF)
+
+
+def _check_awake(hass: HomeAssistant, entry_id: str) -> None:
+    if _asleep(hass, entry_id):
+        raise HomeAssistantError("The PS4 is in rest mode or off: turn it on first (HA doesn't use FTP on a sleeping PS4)")
+
+
 # ── Actions (button + panel) ───────────────────────────────────────────────────
 
 async def async_import_latest(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Device-page button: copy the newest shot. No confirmation (one file, add-only)."""
     rt = _require(hass, entry.entry_id)
+    _check_awake(hass, entry.entry_id)
     _check_free(rt)
     try:
         async with rt.op_lock:
@@ -348,6 +364,8 @@ async def async_set_settings(hass: HomeAssistant, entry_id: str, changes: dict[s
         raise HomeAssistantError("Unknown PS4")
     turned_on = changes.get("enabled") and not rt.settings["enabled"]
     rt.settings.update(changes)
+    if not rt.settings["enabled"]:
+        rt.shown = None
     if rt.settings["enabled"] and not rt.settings["folder"]:
         base = cf.safe_name(device_name(hass, rt.entry)) or "PS4"
         taken = {o.settings.get("folder") for o in _all_runtimes(hass) if o is not rt}
@@ -387,13 +405,23 @@ def _thumb_data(cache: Path, rels: list[str]) -> dict[str, str]:
     return out
 
 
-async def async_list(hass: HomeAssistant, entry_id: str, offset: int, count: int) -> dict[str, Any]:
-    """One page of the newest shots for the panel, thumbnails inline (~15 KB each as base64)."""
+async def async_list(hass: HomeAssistant, entry_id: str, offset: int, count: int,
+                     title_id: str | None = None) -> dict[str, Any]:
+    """One page of the newest shots for the panel, thumbnails inline (~15 KB each as base64). A console in rest mode or
+    off gets no FTP: the page comes from HA's last read (memory only, so none after a restart). With `title_id`: one
+    game's shots for the game page, none while the console sleeps (HA's last read is of the newest shots only)."""
     rt = _require(hass, entry_id)
-    try:
-        shots = await _async_newest(hass, rt, count, offset)
-    except ftplib.all_errors as err:
-        raise _ftp_error(err) from err
+    power = _power(hass, entry_id)
+    asleep = power in (POWER_REST, POWER_OFF)
+    if asleep:
+        shots = rt.shown["shots"] if rt.shown and title_id is None else []
+    else:
+        try:
+            shots = await _async_newest(hass, rt, count, offset, title_id)
+        except ftplib.all_errors as err:
+            raise _ftp_error(err) from err
+        if title_id is None:
+            rt.shown = {"read_at": dt_util.utcnow().isoformat(), "shots": shots[:offset + count]}
     page = shots[offset:offset + count]
     copies = await _async_rescan(hass, rt)
     thumbs = await hass.async_add_executor_job(_thumb_data, _cache_dir(entry_id), [s["rel"] for s in page])
@@ -405,12 +433,15 @@ async def async_list(hass: HomeAssistant, entry_id: str, offset: int, count: int
             for s in page
         ],
         "more": len(shots) > offset + count,
+        "asleep": asleep, "power_state": power,
+        "read_at": rt.shown["read_at"] if rt.shown and title_id is None else None,
     }
 
 
 async def async_plan(hass: HomeAssistant, entry_id: str) -> dict[str, Any]:
     """Full walk for the Sync dialog: what's new, per game, and how much room is left."""
     rt = _require(hass, entry_id)
+    _check_awake(hass, entry_id)
     _check_free(rt)
     async with rt.op_lock:
         try:
@@ -453,6 +484,7 @@ def _pick(shots: list[dict[str, Any]], scope: dict[str, Any]) -> list[dict[str, 
 async def async_start_sync(hass: HomeAssistant, entry_id: str, scope: dict[str, Any]) -> int:
     """Start a copy in the background (it outlives the panel); returns how many new shots it will try."""
     rt = _require(hass, entry_id)
+    _check_awake(hass, entry_id)
     _check_free(rt)
     await rt.op_lock.acquire()
     try:
@@ -460,6 +492,8 @@ async def async_start_sync(hass: HomeAssistant, entry_id: str, scope: dict[str, 
         if scope["kind"] == "selected" and not fresh:
             rels = [r for r in scope.get("rels") or [] if cf.valid_rel(r)]
             shots = await _session(hass, entry_id, lambda ftp: [s for r in rels if (s := cf.shot_by_rel(ftp, r))])
+        elif scope["kind"] == "game" and not fresh:  # the game page: that game's folders only, no full walk
+            shots = await _session(hass, entry_id, partial(cf.all_shots, title_id=str(scope.get("title_id") or "")))
         else:
             shots = rt.plan[1] if fresh else await _session(hass, entry_id, cf.all_shots)  # type: ignore[index]
         copies = await _async_rescan(hass, rt)
@@ -491,6 +525,7 @@ async def async_import_one(hass: HomeAssistant, entry_id: str, rel: str) -> dict
     rt = _require(hass, entry_id)
     if not cf.valid_rel(rel):
         raise HomeAssistantError("Invalid screenshot path")
+    _check_awake(hass, entry_id)
     _check_free(rt)
     try:
         async with rt.op_lock:
@@ -511,6 +546,8 @@ async def async_delete(hass: HomeAssistant, entry_id: str, rels: list[str], *, h
         raise HomeAssistantError("Nothing to delete: tick HA copy and/or PS4 original")
     if not rels or not all(cf.valid_rel(r) for r in rels):
         raise HomeAssistantError("Invalid screenshot path")
+    if ps4:
+        _check_awake(hass, entry_id)  # before HA's copies go: a refused delete deletes nothing
     _check_free(rt)
     result = {"ha_deleted": 0, "ps4_deleted": 0}
     async with rt.op_lock:
@@ -532,6 +569,8 @@ async def async_delete(hass: HomeAssistant, entry_id: str, rels: list[str], *, h
                     lambda: [cf.thumb_local(cache, r).unlink(missing_ok=True) for r in rels]
                 )
                 rt.plan = None
+                if rt.shown:
+                    rt.shown["shots"] = [s for s in rt.shown["shots"] if s["rel"] not in rels]
                 if (rt.settings.get("latest") or {}).get("rel") in rels:
                     try:
                         await _async_newest(hass, rt, 1)  # the Latest screenshot moves to the next newest
@@ -583,7 +622,7 @@ async def _ws_set(hass: HomeAssistant, msg: dict) -> dict[str, Any]:
 
 
 async def _ws_list(hass: HomeAssistant, msg: dict) -> dict[str, Any]:
-    return await async_list(hass, msg["entry_id"], msg["offset"], msg["count"])
+    return await async_list(hass, msg["entry_id"], msg["offset"], msg["count"], msg.get("title_id"))
 
 
 async def _ws_plan(hass: HomeAssistant, msg: dict) -> dict[str, Any]:
@@ -616,6 +655,7 @@ _COMMANDS = (
         vol.Required("type"): "ps4_goldhen/screenshots/list", **_ENTRY,
         vol.Optional("offset", default=0): vol.All(int, vol.Range(min=0, max=100000)),
         vol.Optional("count", default=24): vol.All(int, vol.Range(min=1, max=PAGE_MAX)),
+        vol.Optional("title_id"): str,
     }, _ws_list),
     _cmd({vol.Required("type"): "ps4_goldhen/screenshots/plan", **_ENTRY}, _ws_plan),
     _cmd({

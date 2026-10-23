@@ -7,6 +7,7 @@ test_save_files.py (a 12.00 Pro's user).
 """
 import asyncio
 import copy
+import json
 from datetime import datetime, timedelta, timezone
 import importlib
 from pathlib import Path
@@ -429,6 +430,26 @@ class ManualBackup(Base):
         self.assertEqual(self.rt().usage["versions"], 1)
         self.assertEqual(self.rt().settings["last"]["scope"], [GAME_C])
 
+    async def test_a_pass_first_repairs_what_an_interrupted_one_left(self):
+        await self.turn_on()
+        await self.back_up()
+        write_save(self.console, UID, GAME_C, "SAVEDATAPlayer", b"Q" * 300, "20261016030000", "20261016011910")
+        # HA stopped between install()'s two History moves: the old image in its version, its key still in Latest
+        latest = self.user / LATEST / GAME_C
+        version = self.user / "History/Game C (CUSA90003)/SAVEDATAPlayer/2026-10-16 014221"
+        old = version / "PS4/SAVEDATA/0000000000000000" / GAME_C
+        old.mkdir(parents=True)
+        (latest / "SAVEDATAPlayer").rename(old / "SAVEDATAPlayer")
+        (latest / "sce_sdmemory").unlink()  # and another slot with only its key left
+        await self.back_up()
+        self.assertEqual((old / "SAVEDATAPlayer").read_bytes(), b"P" * 300)
+        self.assertTrue((old / "SAVEDATAPlayer.bin").is_file(), "the old copy is whole again")
+        self.assertEqual((latest / "SAVEDATAPlayer").read_bytes(), b"Q" * 300)
+        self.assertTrue((latest / "SAVEDATAPlayer.bin").is_file())
+        self.assertTrue((latest / "sce_sdmemory").is_file() and (latest / "sce_sdmemory.bin").is_file(), "copied again")
+        self.assertEqual(self.rt().usage["versions"], 1)
+        self.assertEqual(self.rt().settings["last"]["state"], sb.STATUS_UP_TO_DATE)
+
     async def test_one_game_lists_only_that_game(self):
         await self.turn_on()
         before = len(self.ftp_sessions)
@@ -449,6 +470,21 @@ class ManualBackup(Base):
         self.assertEqual(self.files(), [f"{LATEST}/{OTHER}/SAVEDATA01", f"{LATEST}/{OTHER}/SAVEDATA01.bin"])
         with self.assertRaises(HomeAssistantError):
             await sb.async_start_backup(self.hass, "console_a", UID, [{"title_id": "../etc"}])
+
+    async def test_one_game_for_every_user(self):
+        """The Content tab's Back up saves: one title, no user picked."""
+        await self.turn_on()
+        before = len(self.ftp_sessions)
+        await sb.async_start_backup(self.hass, "console_a", title_id=OTHER)
+        await self.drain()
+        walk = self.ftp_sessions[before]
+        self.assertNotIn(f"{sf.HOME_ROOT}/{UID}/savedata/{GAME_C}", walk.listings)
+        self.assertIn(f"{sf.HOME_ROOT}/{UID}/savedata/{OTHER}", walk.listings)
+        self.assertEqual(self.files(), [f"{LATEST}/{OTHER}/SAVEDATA01", f"{LATEST}/{OTHER}/SAVEDATA01.bin"])
+        self.assertEqual(self.rt().settings["last"]["scope"], [OTHER])
+        self.assertIsNone(self.rt().settings["last_success"], "one game isn't a complete backup")
+        with self.assertRaises(HomeAssistantError):
+            await sb.async_start_backup(self.hass, "console_a", title_id="../etc")
 
     async def test_a_slot_written_during_the_copy_is_dropped_and_waits(self):
         await self.turn_on()
@@ -544,6 +580,96 @@ class Limit(Base):
         last = self.rt().settings["last"]
         self.assertEqual((last["copied"], last["skipped"]), (1, 2), "only Player (396) fits in 500 bytes")
         self.assertIsNotNone(sf.local_slot(self.user, GAME_C, "SAVEDATAPlayer"))
+
+
+class Stop(Base):
+    """The panel's Stop: the pass ends after the save it's copying; what it copied stays, the next pass copies the
+    rest."""
+
+    def stop_on(self, slot):
+        """An FTP that presses Stop while `slot`'s image is downloading."""
+        rt = self.rt()
+
+        class StoppingFTP(FakeFTP):
+            def retrbinary(self, cmd, callback, blocksize=8192):
+                super().retrbinary(cmd, callback, blocksize)
+                if cmd.endswith(f"/sdimg_{slot}"):
+                    rt.stop.set()
+
+        self.ftp_class = StoppingFTP
+
+    async def test_stop_keeps_the_save_being_copied_and_the_next_pass_copies_the_rest(self):
+        await self.turn_on()
+        self.stop_on("sce_sdmemory")  # the first save the console lists
+        await self.back_up()
+        rt = self.rt()
+        last = rt.settings["last"]
+        self.assertEqual((last["state"], last["copied"], last["left"]), (sb.STATUS_STOPPED, 1, 2))
+        self.assertEqual(self.files(), [f"{LATEST}/{GAME_C}/sce_sdmemory", f"{LATEST}/{GAME_C}/sce_sdmemory.bin"],
+                         "the save being copied finished; nothing after it started")
+        self.assertEqual(sb.status(rt), sb.STATUS_STOPPED)
+        self.assertIsNone(rt.settings["last_success"], "a stopped pass isn't a full backup")
+        self.assertEqual(rt.progress, {"done": 1, "total": 3})
+        self.assertFalse(rt.op_lock.locked())
+        self.assertFalse(rt.stop.is_set(), "Stop doesn't carry over to the next pass")
+        self.assertFalse((self.root / "PS4 PRO A" / sf.STAGING).exists())
+        self.ftp_class = FakeFTP
+        await self.back_up()
+        last = rt.settings["last"]
+        self.assertEqual((last["state"], last["copied"], last["left"]), (sb.STATUS_UP_TO_DATE, 2, 0))
+        self.assertEqual(len(self.files()), 6)
+        self.assertEqual(rt.settings["last_success"], NOW.isoformat())
+
+    async def test_stop_on_the_last_save_is_a_finished_pass(self):
+        await self.turn_on()
+        self.stop_on("SAVEDATA01")
+        await self.back_up()
+        last = self.rt().settings["last"]
+        self.assertEqual((last["state"], last["copied"], last["left"]), (sb.STATUS_UP_TO_DATE, 3, 0))
+
+    async def test_a_stopped_pass_keeps_the_history_it_never_needed(self):
+        """Over the limit, old History versions make room for new copies; each goes right before its save is
+        copied, so the versions picked for saves a stopped pass never reached stay."""
+        await self.turn_on()
+        await self.back_up(OTHER)
+        for i, modify in enumerate(("20261016010000", "20261016011000")):
+            write_save(self.console, UID, OTHER, "SAVEDATA01", bytes([65 + i]) * 640, modify, "20261015193539")
+            await self.back_up(OTHER)
+        history = self.user / "History" / OTHER / "SAVEDATA01"
+        self.assertEqual(sorted(p.name for p in history.iterdir()), ["2026-10-16 005531", "2026-10-16 010000"])
+        # 400 bytes free: sce_sdmemory (1096, copied first) takes 00:55's room, Player (396) then needs 01:00's
+        await sb.async_set_settings(self.hass, "console_a", {"limit_gb": (3 * 736 + 400) / (1 << 30)})
+        self.stop_on("sce_sdmemory")
+        await self.back_up(GAME_C)
+        last = self.rt().settings["last"]
+        self.assertEqual((last["state"], last["copied"], last["left"]), (sb.STATUS_STOPPED, 1, 1))
+        self.assertEqual(sorted(p.name for p in history.iterdir()), ["2026-10-16 010000"],
+                         "only the version sce_sdmemory needed went")
+        self.ftp_class = FakeFTP
+        await self.back_up(GAME_C)
+        self.assertFalse(history.exists(), "the next pass makes the rest of the room")
+        self.assertEqual(self.rt().settings["last"]["state"], sb.STATUS_UP_TO_DATE)
+
+    async def test_stop_needs_a_running_pass(self):
+        await self.turn_on()
+        with self.assertRaises(HomeAssistantError) as ctx:
+            await sb.async_stop_backup(self.hass, "console_a")
+        self.assertIn("No save backup is running", str(ctx.exception))
+        rt = self.rt()
+        self.assertFalse(sb.settings_view(self.hass, rt)["stopping"])
+        rt.running = True  # mid-pass
+        self.assertEqual(await sb._ws_stop(self.hass, {"entry_id": "console_a"}), {"stopping": True})
+        self.assertTrue(rt.stop.is_set())
+        self.assertTrue(sb.settings_view(self.hass, rt)["stopping"])
+        self.assertEqual(sb.settings_view(self.hass, rt)["status"], sb.STATUS_BACKING_UP)
+        rt.running = False
+        rt.stop.clear()
+
+    def test_stopped_is_a_status_option(self):
+        self.assertIn(sb.STATUS_STOPPED, sb.STATUS_OPTIONS)
+        for name in ("strings.json", "translations/en.json"):
+            states = json.loads((COMP / name).read_text())["entity"]["sensor"]["save_backup_status"]["state"]
+            self.assertEqual(sorted(states), sorted(sb.STATUS_OPTIONS), name)
 
 
 class OpenGames(Base):
@@ -750,6 +876,45 @@ class PanelActions(Base):
         self.assertGreater(len(self.ftp_sessions), sessions)
         with self.assertRaises(HomeAssistantError):
             await sb.async_send(self.hass, "console_a", UID, [item(GAME_C)], target="nowhere")
+
+    async def test_send_and_remove_leave_files_ha_didnt_send(self):
+        """Only what HA uploaded goes: a save someone else put in HA's Fake USB folder stays, and a send that would
+        write over one is refused before anything is written."""
+        self.ftp_class = WritableFTP
+        self.console.add_dir("/data", "20260101000000")
+        await sb.async_send(self.hass, "console_a", UID, [item(OTHER)])
+        other = f"{sf.FAKE_USB_SAVES}/{OTHER}"
+        self.assertEqual(self.rt().settings["fake_usb_files"], [f"{other}/SAVEDATA01", f"{other}/SAVEDATA01.bin"])
+        theirs = [f"{other}/SAVEDATA99", f"{other}/SAVEDATA99.bin"]
+        for path in theirs:
+            self.console.add_file(path, b"mine", "20261016120000")
+        await sb.async_send(self.hass, "console_a", UID, [item(GAME_C)])
+        self.assertNotIn(f"{other}/SAVEDATA01", self.console.files, "HA's last send is replaced")
+        self.assertEqual([self.console.files[p] for p in theirs], [b"mine", b"mine"])
+        self.assertEqual(self.rt().console["fake_usb"], {OTHER: ["SAVEDATA99"], GAME_C: ["SAVEDATAPlayer", "sce_sdmemory"]})
+        self.assertEqual(await sb.async_clear_sent(self.hass, "console_a"), 4)
+        self.assertEqual(sorted(self.fake_usb()), theirs)
+        self.assertEqual(self.rt().console["fake_usb"], {OTHER: ["SAVEDATA99"]}, "the PS4 pane shows what's left")
+        self.assertEqual(self.rt().settings["fake_usb_files"], [])
+
+        fake = f"{sf.FAKE_USB_SAVES}/{GAME_C}"
+        self.console.add_dir(fake, "20261016120000")
+        self.console.add_file(f"{fake}/SAVEDATAPlayer.bin", b"mine", "20261016120000")
+        before = [p for ftp in self.ftp_sessions for p in getattr(ftp, "stored", [])]
+        with self.assertRaisesRegex(HomeAssistantError, f"already holds {GAME_C}/SAVEDATAPlayer.bin, not sent by HA: mo"):
+            await sb.async_send(self.hass, "console_a", UID, [item(GAME_C)])
+        self.assertEqual([p for ftp in self.ftp_sessions for p in getattr(ftp, "stored", [])], before, "nothing written")
+        self.assertEqual(self.console.files[f"{fake}/SAVEDATAPlayer.bin"], b"mine")
+        self.assertEqual((self.rt().settings["fake_usb_files"], self.rt().settings["sent"]), ([], None))
+
+    async def test_a_send_recorded_before_file_lists_is_still_removed(self):
+        self.ftp_class = WritableFTP
+        self.console.add_dir("/data", "20260101000000")
+        await sb.async_send(self.hass, "console_a", UID, [item(GAME_C)])
+        Store.saved[f"{const.DOMAIN}.saves.console_a"].pop("fake_usb_files")  # as 1.0.0 saved it: only `sent`
+        await self.add_console("console_a")  # HA restarted on the update
+        self.assertEqual(await sb.async_clear_sent(self.hass, "console_a"), 4)
+        self.assertEqual(self.fake_usb(), {})
 
     async def test_settings_view(self):
         view = sb.settings_view(self.hass, self.rt())
